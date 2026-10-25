@@ -1853,31 +1853,25 @@ async fn handle_sftp_commands(
             SftpCmd::PrefetchDirs { paths } => {
                 use futures::stream::StreamExt;
 
-                // A shared reference is Copy, so each future gets its own.
+                // Shared references are Copy, so each future gets its own.
                 let sftp_ref = &sftp;
-                let results: Vec<(String, anyhow::Result<Vec<FileEntry>>)> =
-                    futures::stream::iter(paths.into_iter().map(|path| async move {
-                        let result = list_dir_resolved(sftp_ref, &path).await;
-                        (path, result)
-                    }))
-                    .buffer_unordered(READDIR_BATCH_CONCURRENCY)
-                    .collect()
-                    .await;
-
-                for (path, result) in results {
-                    match result {
+                let event_tx = &event_tx;
+                // Each folder is sent as soon as it is listed: the user may be
+                // waiting on it while a big one in the same batch still loads.
+                futures::stream::iter(paths.into_iter().map(|path| async move {
+                    let result = list_dir_resolved(sftp_ref, &path).await;
+                    (path, result)
+                }))
+                .buffer_unordered(READDIR_BATCH_CONCURRENCY)
+                .for_each(|(path, result)| async move {
+                    let event = match result {
                         Ok(entries) => {
                             tracing::debug!(
                                 target: "flint::prefetch",
                                 "prefetched {}: {} entries",
                                 path, entries.len()
                             );
-                            let _ = event_tx
-                                .send(SftpEvent::PrefetchComplete {
-                                    path: path.clone(),
-                                    entries,
-                                })
-                                .await;
+                            SftpEvent::PrefetchComplete { path, entries }
                         }
                         Err(e) => {
                             tracing::debug!(
@@ -1885,16 +1879,16 @@ async fn handle_sftp_commands(
                                 "prefetch failed for {}: {}",
                                 path, e
                             );
-                            let _ = event_tx
-                                .send(SftpEvent::ListFailed {
-                                    path,
-                                    error: e.to_string(),
-                                    is_background: true,
-                                })
-                                .await;
+                            SftpEvent::ListFailed {
+                                path,
+                                error: e.to_string(),
+                                is_background: true,
+                            }
                         }
-                    }
-                }
+                    };
+                    let _ = event_tx.send(event).await;
+                })
+                .await;
             }
         }
     }
