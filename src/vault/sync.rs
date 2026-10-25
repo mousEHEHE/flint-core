@@ -1621,6 +1621,7 @@ mod tests {
             jump_host: None,
             forwards: Vec::new(),
             startup_snippet: None,
+            snippets: Vec::new(),
             created_at: 1,
             updated_at: 1,
         }

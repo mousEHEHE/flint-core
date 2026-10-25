@@ -411,6 +411,15 @@ pub struct Snippet {
     pub usages: Vec<SnippetUsage>,
 }
 
+/// A command that belongs to one host, kept in its entry: it syncs, is shared
+/// and is deleted with the host. Not in the shared snippet list.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HostSnippet {
+    pub id: Uuid,
+    pub name: String,
+    pub script: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnippetUsage {
     pub server_id: Uuid,
@@ -595,9 +604,11 @@ pub struct ServerEntry {
     pub jump_host: Option<Uuid>,
     #[serde(default)]
     pub forwards: Vec<PortForward>,
-    /// Sent to the shell after every connect.
+    /// Sent to the shell after every connect: a shared snippet or one of `snippets`.
     #[serde(default)]
     pub startup_snippet: Option<Uuid>,
+    #[serde(default)]
+    pub snippets: Vec<HostSnippet>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -623,6 +634,7 @@ impl fmt::Debug for ServerEntry {
             // Forwards hold no secrets, but a count keeps the line readable.
             .field("forwards", &self.forwards.len())
             .field("startup_snippet", &self.startup_snippet)
+            .field("snippets", &self.snippets.len())
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .finish_non_exhaustive()

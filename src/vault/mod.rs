@@ -9,10 +9,10 @@ pub mod sync;
 
 pub use error::VaultError;
 pub use format::{
-    resolve_jump_chain, resolve_proxy, ssh_command, AuthMethod, Group, PortForward, ProxyAuth,
-    ProxyChoice, ProxyDef, ProxyDefSummary, ProxyKind, ProxyMode, ProxyRouting, ServerEntry,
-    ServerEntrySummary, Snippet, SnippetBody, SnippetUsage, SshKey, SshKeySummary, Tag,
-    MAX_JUMP_HOSTS,
+    resolve_jump_chain, resolve_proxy, ssh_command, AuthMethod, Group, HostSnippet, PortForward,
+    ProxyAuth, ProxyChoice, ProxyDef, ProxyDefSummary, ProxyKind, ProxyMode, ProxyRouting,
+    ServerEntry, ServerEntrySummary, Snippet, SnippetBody, SnippetUsage, SshKey, SshKeySummary,
+    Tag, MAX_JUMP_HOSTS,
 };
 pub use recovery::RecoveryPhrase;
 
@@ -1309,6 +1309,73 @@ impl VaultManager {
             .ok_or(VaultError::SnippetNotFound(id))
     }
 
+    /// What `snippet_id` sends on `entry_id`: one of the host's own snippets,
+    /// or a shared one.
+    pub fn script_for_host(&self, entry_id: Uuid, snippet_id: Uuid) -> Option<String> {
+        let entry_id = self.current_id(entry_id);
+        let own = self
+            .payload
+            .entries
+            .iter()
+            .find(|e| e.id == entry_id)
+            .and_then(|e| e.snippets.iter().find(|s| s.id == snippet_id));
+        if let Some(snippet) = own {
+            return Some(snippet.script.clone());
+        }
+        let SnippetBody::Script { content } = &self.get_snippet(snippet_id).ok()?.body;
+        Some(content.clone())
+    }
+
+    /// Add or replace one of a host's own snippets.
+    pub fn save_host_snippet(
+        &mut self,
+        entry_id: Uuid,
+        snippet: HostSnippet,
+    ) -> Result<(), VaultError> {
+        let entry = self.entry_mut(entry_id)?;
+        match entry.snippets.iter_mut().find(|s| s.id == snippet.id) {
+            Some(stored) => *stored = snippet,
+            None => entry.snippets.push(snippet),
+        }
+        entry.updated_at = unix_now() as i64;
+        self.save()
+    }
+
+    /// The host stops running it on connect if it did.
+    pub fn delete_host_snippet(
+        &mut self,
+        entry_id: Uuid,
+        snippet_id: Uuid,
+    ) -> Result<(), VaultError> {
+        let entry = self.entry_mut(entry_id)?;
+        entry.snippets.retain(|s| s.id != snippet_id);
+        if entry.startup_snippet == Some(snippet_id) {
+            entry.startup_snippet = None;
+        }
+        entry.updated_at = unix_now() as i64;
+        self.save()
+    }
+
+    pub fn set_startup_snippet(
+        &mut self,
+        entry_id: Uuid,
+        snippet_id: Option<Uuid>,
+    ) -> Result<(), VaultError> {
+        let entry = self.entry_mut(entry_id)?;
+        entry.startup_snippet = snippet_id;
+        entry.updated_at = unix_now() as i64;
+        self.save()
+    }
+
+    fn entry_mut(&mut self, id: Uuid) -> Result<&mut ServerEntry, VaultError> {
+        let id = self.current_id(id);
+        self.payload
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or(VaultError::EntryNotFound(id))
+    }
+
     fn new_with_dek(
         path: &Path,
         dek: &[u8; 32],
@@ -1497,6 +1564,7 @@ mod tests {
             jump_host: None,
             forwards: Vec::new(),
             startup_snippet: None,
+            snippets: Vec::new(),
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
         }
@@ -1926,6 +1994,76 @@ mod tests {
         vm.delete_snippet(snip).unwrap();
         assert_eq!(vm.get_entry(entry_id).unwrap().startup_snippet, None);
         assert_eq!(vm.find_snippet_by_name("Tail syslog"), None);
+    }
+
+    #[test]
+    fn a_host_runs_its_own_snippets_and_the_shared_ones() {
+        let dir = tempdir().unwrap();
+        let (mut vm, _) = make_vault(dir.path());
+        let shared = vm
+            .add_snippet(
+                "Disk".into(),
+                None,
+                SnippetBody::Script {
+                    content: "df -h".into(),
+                },
+            )
+            .unwrap();
+        let entry = test_entry();
+        let entry_id = entry.id;
+        vm.add_entry(entry).unwrap();
+        let own = HostSnippet {
+            id: Uuid::new_v4(),
+            name: "App".into(),
+            script: "cd /srv/app".into(),
+        };
+        vm.save_host_snippet(entry_id, own.clone()).unwrap();
+
+        assert_eq!(
+            vm.script_for_host(entry_id, own.id).as_deref(),
+            Some("cd /srv/app")
+        );
+        assert_eq!(
+            vm.script_for_host(entry_id, shared).as_deref(),
+            Some("df -h")
+        );
+        assert_eq!(vm.script_for_host(entry_id, Uuid::new_v4()), None);
+        // Not one of the shared snippets.
+        assert_eq!(vm.list_snippets().unwrap().len(), 1);
+
+        let edited = HostSnippet {
+            script: "cd /srv/app && git status".into(),
+            ..own.clone()
+        };
+        vm.save_host_snippet(entry_id, edited).unwrap();
+        let stored = vm.get_entry(entry_id).unwrap();
+        assert_eq!(stored.snippets.len(), 1);
+        assert_eq!(stored.snippets[0].script, "cd /srv/app && git status");
+    }
+
+    #[test]
+    fn deleting_a_host_snippet_stops_it_running_on_connect() {
+        let dir = tempdir().unwrap();
+        let (mut vm, _) = make_vault(dir.path());
+        let entry = test_entry();
+        let entry_id = entry.id;
+        vm.add_entry(entry).unwrap();
+        let own = HostSnippet {
+            id: Uuid::new_v4(),
+            name: "On connect".into(),
+            script: "cd /srv/app".into(),
+        };
+        vm.save_host_snippet(entry_id, own.clone()).unwrap();
+        vm.set_startup_snippet(entry_id, Some(own.id)).unwrap();
+        assert_eq!(
+            vm.get_entry(entry_id).unwrap().startup_snippet,
+            Some(own.id)
+        );
+
+        vm.delete_host_snippet(entry_id, own.id).unwrap();
+        let stored = vm.get_entry(entry_id).unwrap();
+        assert!(stored.snippets.is_empty());
+        assert_eq!(stored.startup_snippet, None);
     }
 
     #[test]
