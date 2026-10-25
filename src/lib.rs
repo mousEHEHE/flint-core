@@ -5,6 +5,7 @@ pub mod account;
 pub mod app;
 pub mod connection;
 pub mod forward;
+pub mod route;
 pub mod shell;
 pub mod ssh;
 pub mod ssh_target;

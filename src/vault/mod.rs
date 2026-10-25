@@ -382,6 +382,29 @@ impl VaultManager {
         ))
     }
 
+    /// Opens the vault with a key from `device_key`, for a phone that keeps it in its keychain.
+    /// A key that does not open this file gives `InvalidPassword`.
+    pub fn unlock_with_device_key(path: &Path, key: &[u8; 32]) -> Result<Self, VaultError> {
+        let vf = storage::read_vault(path)?;
+        let payload =
+            Self::decrypt_payload(key, &vf.enc_payload).map_err(|_| VaultError::InvalidPassword)?;
+        Ok(Self::new_with_dek(
+            path,
+            key,
+            vf.kdf_salt,
+            vf.kdf_params,
+            vf.enc_dek_by_password,
+            vf.enc_dek_by_recovery,
+            payload,
+        ))
+    }
+
+    /// The key that opens this vault without the password. As secret as the password: only for
+    /// the device's own keychain.
+    pub fn device_key(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(*self.dek)
+    }
+
     /// Set `new_password` and rotate both DEK slots: the old password and `phrase` stop working.
     /// Returns a new phrase to show the user once. A wrong phrase gives `InvalidRecoveryPhrase`.
     pub fn unlock_with_recovery(
@@ -671,6 +694,28 @@ impl VaultManager {
             return Ok(());
         }
         entry.last_local_dir = Some(local);
+        entry.last_remote_dir = Some(remote);
+        self.save_later();
+        Ok(())
+    }
+
+    /// The server folder alone, for a device with no local folder pane: a phone. The computer's
+    /// local folder stays as it was. No-op if unchanged.
+    pub fn set_entry_last_remote_dir(
+        &mut self,
+        id: Uuid,
+        remote: String,
+    ) -> Result<(), VaultError> {
+        let id = self.current_id(id);
+        let entry = self
+            .payload
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or(VaultError::EntryNotFound(id))?;
+        if entry.last_remote_dir.as_deref() == Some(remote.as_str()) {
+            return Ok(());
+        }
         entry.last_remote_dir = Some(remote);
         self.save_later();
         Ok(())
@@ -1997,6 +2042,26 @@ mod tests {
     }
 
     #[test]
+    fn a_phone_sets_the_server_folder_and_keeps_the_computers_folder() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.bin");
+        let (mut vm, _) = VaultManager::create_with_params(&path, &pw("pw"), fast_kdf()).unwrap();
+        let entry = test_entry();
+        let id = entry.id;
+        vm.add_entry(entry).unwrap();
+        vm.set_entry_last_dirs(id, "/Users/me/work".into(), "/srv/app".into())
+            .unwrap();
+
+        vm.set_entry_last_remote_dir(id, "/var/log".into()).unwrap();
+        vm.lock();
+
+        let vm2 = VaultManager::unlock_with_password(&path, &pw("pw")).unwrap();
+        let entry = vm2.get_entry(id).unwrap();
+        assert_eq!(entry.last_remote_dir.as_deref(), Some("/var/log"));
+        assert_eq!(entry.last_local_dir.as_deref(), Some("/Users/me/work"));
+    }
+
+    #[test]
     fn set_entry_password_replaces_only_a_stored_password() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.bin");
@@ -2059,6 +2124,33 @@ mod tests {
             matches!(err, VaultError::InvalidPassword),
             "expected InvalidPassword, got {err:?}"
         );
+    }
+
+    #[test]
+    fn the_device_key_opens_the_vault_without_the_password() {
+        let dir = tempdir().unwrap();
+        let (mut vm, _) = make_vault(dir.path());
+        vm.add_entry(test_entry()).unwrap();
+        let path = vm.path.clone();
+        let key = vm.device_key();
+        vm.lock();
+
+        let vm = VaultManager::unlock_with_device_key(&path, &key).unwrap();
+        assert_eq!(vm.list_entries().unwrap().len(), 1);
+        drop(vm);
+        // The password still works next to it.
+        VaultManager::unlock_with_password(&path, &pw("hunter2")).unwrap();
+    }
+
+    #[test]
+    fn a_wrong_device_key_returns_invalid_password() {
+        let dir = tempdir().unwrap();
+        let (vm, _) = make_vault(dir.path());
+        let path = vm.path.clone();
+        vm.lock();
+
+        let err = VaultManager::unlock_with_device_key(&path, &[9; 32]).unwrap_err();
+        assert!(matches!(err, VaultError::InvalidPassword), "got {err:?}");
     }
 
     #[test]

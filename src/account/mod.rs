@@ -2,6 +2,7 @@
 //! Argon2id, so it runs on worker threads; results go into the vault on the main thread.
 
 pub mod api;
+pub mod flow;
 pub mod oauth;
 pub mod team;
 
@@ -19,7 +20,7 @@ use crate::vault::{
 };
 
 pub use api::{Api, ApiError, GitHubStep};
-pub use oauth::OAuthError;
+pub use oauth::{Landing, OAuthError};
 
 /// The server takes at most 500 changes and 8 MiB per request; base64 makes blobs a third larger.
 const MAX_CHANGES_PER_PUSH: usize = 500;
@@ -50,9 +51,15 @@ pub fn github_sign_in(
     api: &Api,
     open_browser: impl FnOnce(String),
     is_cancelled: &AtomicBool,
+    landing: Landing,
 ) -> Result<GitHubStep, AccountError> {
     let config = api.config()?;
-    let callback = oauth::authorize(&config.github_client_id, open_browser, is_cancelled)?;
+    let callback = oauth::authorize(
+        &config.github_client_id,
+        open_browser,
+        is_cancelled,
+        landing,
+    )?;
     Ok(api.sign_in_with_github(
         &callback.code,
         &callback.code_verifier,
