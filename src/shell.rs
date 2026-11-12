@@ -77,11 +77,30 @@ pub enum ScrollTarget {
 pub struct ShellHandle {
     cmd_tx: Sender<ShellCmd>,
     event_rx: Receiver<ShellEvent>,
+    is_visible_tx: watch::Sender<bool>,
 }
 
 impl ShellHandle {
-    pub(crate) fn new(cmd_tx: Sender<ShellCmd>, event_rx: Receiver<ShellEvent>) -> Self {
-        Self { cmd_tx, event_rx }
+    pub(crate) fn new(
+        cmd_tx: Sender<ShellCmd>,
+        event_rx: Receiver<ShellEvent>,
+        is_visible_tx: watch::Sender<bool>,
+    ) -> Self {
+        Self {
+            cmd_tx,
+            event_rx,
+            is_visible_tx,
+        }
+    }
+
+    /// A hidden tab stops copying the screen, like a hidden window, and gets
+    /// one fresh copy when shown again.
+    pub fn set_visible(&self, is_visible: bool) {
+        self.is_visible_tx.send_if_modified(|current| {
+            let is_changed = *current != is_visible;
+            *current = is_visible;
+            is_changed
+        });
     }
 
     pub async fn send_input(&self, data: Vec<u8>) {
@@ -317,6 +336,7 @@ pub async fn handle_shell_commands(
     initial_cols: u16,
     cmd_rx: Receiver<ShellCmd>,
     event_tx: Sender<ShellEvent>,
+    mut tab_visibility: watch::Receiver<bool>,
 ) {
     let mut emulator = TermEmulator::new(initial_rows, initial_cols);
     let mut window_visibility = IS_WINDOW_VISIBLE.subscribe();
@@ -402,7 +422,14 @@ pub async fn handle_shell_commands(
             }
 
             Ok(()) = window_visibility.changed() => {
-                if *window_visibility.borrow_and_update() && is_snapshot_stale {
+                if is_shown(&window_visibility, &tab_visibility) && is_snapshot_stale {
+                    is_snapshot_stale = false;
+                    let _ = event_tx.send(ShellEvent::Snapshot(emulator.snapshot())).await;
+                }
+            }
+
+            Ok(()) = tab_visibility.changed() => {
+                if is_shown(&window_visibility, &tab_visibility) && is_snapshot_stale {
                     is_snapshot_stale = false;
                     let _ = event_tx.send(ShellEvent::Snapshot(emulator.snapshot())).await;
                 }
@@ -410,7 +437,7 @@ pub async fn handle_shell_commands(
 
             () = &mut snapshot_timer, if is_snapshot_due => {
                 is_snapshot_due = false;
-                if *window_visibility.borrow() {
+                if is_shown(&window_visibility, &tab_visibility) {
                     last_snapshot_at = Instant::now();
                     let _ = event_tx.send(ShellEvent::Snapshot(emulator.snapshot())).await;
                 } else {
@@ -429,7 +456,7 @@ pub async fn handle_shell_commands(
                                 break;
                             }
                         }
-                        if !*window_visibility.borrow() {
+                        if !is_shown(&window_visibility, &tab_visibility) {
                             is_snapshot_stale = true;
                         } else if last_snapshot_at.elapsed() >= SNAPSHOT_INTERVAL {
                             // A keystroke's echo goes out at once.
@@ -456,6 +483,10 @@ pub async fn handle_shell_commands(
             }
         }
     }
+}
+
+fn is_shown(window: &watch::Receiver<bool>, tab: &watch::Receiver<bool>) -> bool {
+    *window.borrow() && *tab.borrow()
 }
 
 /// One shell word for POSIX shells, fish and csh. `'`, `\` and `!` go outside the quotes:

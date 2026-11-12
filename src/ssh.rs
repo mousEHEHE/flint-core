@@ -486,6 +486,7 @@ pub enum SftpCmd {
         remote: String,
         local: std::path::PathBuf,
         size: u64,
+        cancel: CancelFlag,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
     },
     /// Fetch many known-size files at once, see [`SftpHandle::stage_files`].
@@ -917,11 +918,13 @@ impl SftpHandle {
 
     /// Fetch `remote` given its size from a listing. This saves four of the five
     /// round trips of [`Self::download_file`], so a drag-out copy lands in time.
+    /// A canceled copy stops and removes `local`.
     pub async fn stage_file(
         &self,
         remote: String,
         local: std::path::PathBuf,
         size: u64,
+        cancel: CancelFlag,
     ) -> anyhow::Result<()> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
@@ -929,6 +932,7 @@ impl SftpHandle {
                 remote,
                 local,
                 size,
+                cancel,
                 reply: reply_tx,
             })
             .await
@@ -1561,10 +1565,13 @@ async fn open_shell_channel(
 
     let (cmd_tx, cmd_rx) = async_channel::bounded(64);
     let (event_tx, event_rx) = async_channel::bounded(64);
+    let (visible_tx, visible_rx) = tokio::sync::watch::channel(true);
 
-    tokio::task::spawn_local(handle_shell_commands(channel, rows, cols, cmd_rx, event_tx));
+    tokio::task::spawn_local(handle_shell_commands(
+        channel, rows, cols, cmd_rx, event_tx, visible_rx,
+    ));
 
-    Ok(ShellHandle::new(cmd_tx, event_rx))
+    Ok(ShellHandle::new(cmd_tx, event_rx, visible_tx))
 }
 
 async fn open_exec_channel(
@@ -1590,18 +1597,27 @@ async fn open_exec_channel(
     Ok(ExecHandle { stdout_rx })
 }
 
-/// Pump one exec channel until the command exits. Dropping the handle closes
-/// `stdout_tx`'s receiver, which stops the pump at the next piece of output.
+/// Pump one exec channel until the command exits or every receiver is dropped.
 async fn drive_exec_channel(
     mut channel: Channel<client::Msg>,
     stdout_tx: async_channel::Sender<Vec<u8>>,
 ) {
-    while let Some(msg) = channel.wait().await {
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = stdout_tx.closed() => {
+                // russh does not close a dropped channel, so a timed out command would stay open.
+                tracing::debug!("exec handle dropped, closing channel");
+                let _ = channel.close().await;
+                return;
+            }
+            msg = channel.wait() => msg,
+        };
+        let Some(msg) = msg else { return };
         match msg {
             ChannelMsg::Data { data } => {
-                if stdout_tx.send(data.to_vec()).await.is_err() {
-                    break;
-                }
+                // A failed send means the handle is gone; the next turn closes the channel.
+                let _ = stdout_tx.send(data.to_vec()).await;
             }
             ChannelMsg::ExtendedData { data, ext: 1 } => {
                 tracing::debug!(stderr = %String::from_utf8_lossy(&data), "exec stderr");
@@ -1751,14 +1767,23 @@ async fn handle_sftp_commands(
                 });
             }
 
+            // Its own task, so a big click or drag copy does not hold up the
+            // next command, and a canceled one goes away with its part file.
             SftpCmd::StageFile {
                 remote,
                 local,
                 size,
+                cancel,
                 reply,
             } => {
-                let result = stage_file(&sftp, &remote, &local, size).await;
-                let _ = reply.send(result);
+                let sftp = sftp.clone();
+                transfers.spawn_local(async move {
+                    let result = stage_file(&sftp, &remote, &local, size, Some(&cancel)).await;
+                    if result.is_err() {
+                        let _ = tokio::fs::remove_file(&local).await;
+                    }
+                    let _ = reply.send(result);
+                });
             }
 
             SftpCmd::StageFiles { items, reply } => {
@@ -2994,6 +3019,7 @@ async fn stage_file(
     remote: &str,
     local: &std::path::Path,
     size: u64,
+    cancel: Option<&CancelFlag>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -3004,6 +3030,9 @@ async fn stage_file(
     let mut buf = vec![0u8; TRANSFER_CHUNK];
     let mut written = 0u64;
     while written < size {
+        if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(anyhow::Error::new(TransferCanceled));
+        }
         let n = remote_file.read(&mut buf).await?;
         if n == 0 {
             break;
@@ -3032,7 +3061,7 @@ async fn stage_files_concurrent(sftp: &SftpSession, items: Vec<StageItem>) -> Ve
 
     stream::iter(items)
         .map(|item| async move {
-            match stage_file(sftp, &item.remote, &item.local, item.size).await {
+            match stage_file(sftp, &item.remote, &item.local, item.size, None).await {
                 Ok(()) => Some(item.remote),
                 Err(e) => {
                     tracing::debug!(target: "flint::dragout", remote = item.remote, "staging skipped: {e}");
