@@ -243,6 +243,21 @@ impl Record {
         Sha256::digest(self.to_cbor()).into()
     }
 
+    fn kind(&self) -> &'static str {
+        match self {
+            Record::Entry(_) => "host",
+            Record::Key(_) => "key",
+            Record::Snippet(_) => "snippet",
+            Record::Group(_) => "folder",
+            Record::Tag(_) => "tag",
+            Record::Proxy(_) => "proxy",
+            Record::ProxyRouting(_) => "proxy routing",
+            Record::Team(_) => "team",
+            Record::Join(_) => "join",
+            Record::Deleted => "deleted",
+        }
+    }
+
     fn to_cbor(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         ciborium::into_writer(self, &mut bytes).expect("a record always encodes to CBOR");
@@ -288,12 +303,13 @@ impl Record {
         }
     }
 
-    /// Whether a local edit beats the server's version. Only hosts and snippets
+    /// Whether a local edit beats the server's version. Only hosts, snippets and keys
     /// have an edit time; otherwise the server wins.
     fn is_newer_than(&self, server: &Record) -> bool {
         match (self, server) {
             (Record::Entry(mine), Record::Entry(theirs)) => mine.updated_at > theirs.updated_at,
             (Record::Snippet(mine), Record::Snippet(theirs)) => mine.updated_at > theirs.updated_at,
+            (Record::Key(mine), Record::Key(theirs)) => mine.updated_at > theirs.updated_at,
             // A pin only ever moves forward along the team's roster chain.
             (Record::Team(mine), Record::Team(theirs)) => mine.seq > theirs.seq,
             _ => false,
@@ -302,6 +318,36 @@ impl Record {
 }
 
 impl VaultPayload {
+    /// Fills `public_key` on keys saved before it was stored. Only a fill, not an edit, so
+    /// the synced hash moves along and nothing is sent. Unlock runs off the UI thread.
+    pub(super) fn fill_public_keys(&mut self) {
+        let empty: Vec<Uuid> = self
+            .keys
+            .iter()
+            .filter(|key| key.public_key.is_empty())
+            .map(|key| key.id)
+            .collect();
+        for id in empty {
+            let before = self.record(id).map(|record| record.hash());
+            if let Some(key) = self.keys.iter_mut().find(|key| key.id == id) {
+                super::fill_public_key(key);
+            }
+            let after = self.record(id).map(|record| record.hash());
+            let Some(state) = &mut self.sync else {
+                continue;
+            };
+            let vault_id = state.shared.get(&id).copied().unwrap_or(state.vault_id);
+            let synced = state
+                .ledger_mut(vault_id)
+                .and_then(|ledger| ledger.items.get_mut(&id));
+            if let (Some(synced), Some(before), Some(after)) = (synced, before, after) {
+                if synced.hash == before {
+                    synced.hash = after;
+                }
+            }
+        }
+    }
+
     /// Every record as it is shared. Device-only fields (last opened, last folders, runs) are
     /// left out, so using a host does not count as editing it.
     fn records(&self) -> BTreeMap<Uuid, Record> {
@@ -913,10 +959,15 @@ impl VaultManager {
         item_key: &[u8; 32],
         item: &PulledItem,
     ) -> bool {
-        let Some(theirs) = Record::open(item_key, item.id, &item.blob) else {
+        let Some(mut theirs) = Record::open(item_key, item.id, &item.blob) else {
             tracing::warn!(id = %item.id, "skipping a synced item this build cannot read");
             return false;
         };
+        // Never trusted as sent: it goes into authorized_keys, so it must match the pem.
+        // shortcut: a passphrase key runs its KDF here on the UI thread; move it if that shows.
+        if let Record::Key(key) = &mut theirs {
+            super::fill_public_key(key);
+        }
         // The flag is unencrypted and the server could set it; only the sealed marker deletes.
         if item.is_deleted != matches!(theirs, Record::Deleted) {
             tracing::warn!(id = %item.id, "skipping a synced item whose deleted flag does not match it");
@@ -941,10 +992,18 @@ impl VaultManager {
                 ledger.items.remove(&item.id);
                 return false;
             }
-            // Kept if a host here still uses this folder or tag, or the record is back after an
-            // older deletion: it reads as edited on top, so the next round restores it for all.
-            let is_back = mine.is_some() && !ledger.items.contains_key(&item.id);
-            if is_back || (mine.is_some() && self.payload.is_label_in_use(item.id)) {
+            // Kept if in use, back after an old deletion, or edited here; the next round resends it.
+            let known_hash = ledger.items.get(&item.id).map(|known| known.hash);
+            let is_back = mine.is_some() && known_hash.is_none();
+            // shortcut: an automatic write (OS, host key) counts as an edit too and keeps a host
+            // deleted elsewhere; the ledger would need the synced updated_at to tell them apart.
+            let is_edited_here = mine
+                .as_ref()
+                .is_some_and(|mine| known_hash.is_some_and(|known| known != mine.hash()));
+            if is_back
+                || is_edited_here
+                || (mine.is_some() && self.payload.is_label_in_use(item.id))
+            {
                 ledger.items.insert(
                     item.id,
                     SyncedItem {
@@ -983,6 +1042,10 @@ impl VaultManager {
         let keeps_mine = mine
             .as_ref()
             .is_some_and(|mine| is_edited_here && mine.is_newer_than(&theirs));
+        let is_same_content = mine.as_ref().map(Record::hash) == Some(theirs.hash());
+        if is_edited_here && !keeps_mine && mine.is_some() && !is_same_content {
+            tracing::warn!(id = %item.id, kind = theirs.kind(), "a local edit gives way to the server's version");
+        }
         if keeps_mine {
             // Ours now differs from the noted version, so the next round sends it on top.
             ledger.items.insert(
@@ -1370,13 +1433,15 @@ impl VaultManager {
         else {
             return;
         };
-        match state.shared.get(&key_id) {
-            None => {
-                state.shared.insert(key_id, vault_id);
-                return;
-            }
-            Some(home) if *home == vault_id => return,
-            Some(_) => {}
+        // A personal key that hosts outside this vault also use must stay where they see it.
+        let is_used_elsewhere = self.payload.entries.iter().any(|other| {
+            other.id != entry_id
+                && matches!(other.auth, AuthMethod::PrivateKey { key_id: id } if id == key_id)
+                && state.shared.get(&other.id) != Some(&vault_id)
+        });
+        let home = state.shared.get(&key_id).copied();
+        if home == Some(vault_id) {
+            return;
         }
 
         // An earlier move may have left the same key in this vault already.
@@ -1386,6 +1451,10 @@ impl VaultManager {
                 && other.passphrase == key.passphrase
         };
         let twin = self.payload.keys.iter().find(is_twin).map(|other| other.id);
+        if twin.is_none() && home.is_none() && !is_used_elsewhere {
+            state.shared.insert(key_id, vault_id);
+            return;
+        }
         let copy_id = twin.unwrap_or_else(|| {
             let copy = SshKey {
                 id: Uuid::new_v4(),
@@ -1769,6 +1838,8 @@ mod tests {
             key_type: "ed25519".into(),
             pem: format!("pem of {name}"),
             passphrase: None,
+            public_key: String::new(),
+            updated_at: 0,
         }
     }
 
@@ -2584,6 +2655,80 @@ mod tests {
     }
 
     #[test]
+    fn a_key_edited_here_later_than_the_server_copy_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = synced_vault(&dir, "first.bin");
+        let mut second = second_device(&dir, &first);
+        let mut server = FakeServer::default();
+
+        let key = ssh_key("deploy");
+        first.payload.keys.push(key.clone());
+        server.sync(&mut first);
+        server.sync(&mut second);
+
+        let rename = |vault: &mut VaultManager, name: &str, updated_at: i64| {
+            let key = &mut vault.payload.keys[0];
+            key.name = name.into();
+            key.updated_at = updated_at;
+        };
+        rename(&mut first, "older", 5);
+        rename(&mut second, "newer", 9);
+        server.sync(&mut first);
+        server.sync(&mut second);
+        server.sync(&mut second);
+        server.sync(&mut first);
+
+        assert_eq!(first.get_key(key.id).unwrap().name, "newer");
+        assert_eq!(second.get_key(key.id).unwrap().name, "newer");
+    }
+
+    #[test]
+    fn a_pulled_public_key_comes_from_the_pem_and_a_fill_sends_nothing() {
+        const PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACBSrT4gKjhtn5u267EcdofVgSVUGF0Yo4EtvpThw90uNQAAAIhrUZbMa1GW
+zAAAAAtzc2gtZWQyNTUxOQAAACBSrT4gKjhtn5u267EcdofVgSVUGF0Yo4EtvpThw90uNQ
+AAAEA9LGAPFGzV6Uf63tOpOfBPj4rCccBhAWtYOhbYqNdHcVKtPiAqOG2fm7brsRx2h9WB
+JVQYXRijgS2+lOHD3S41AAAAAAECAwQF
+-----END OPENSSH PRIVATE KEY-----
+";
+        const PUBLIC: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFKtPiAqOG2fm7brsRx2h9WBJVQYXRijgS2+lOHD3S41";
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = synced_vault(&dir, "first.bin");
+        let mut second = second_device(&dir, &first);
+        let mut server = FakeServer::default();
+
+        let key = SshKey {
+            pem: PEM.into(),
+            public_key: "ssh-ed25519 someone-elses-key".into(),
+            ..ssh_key("deploy")
+        };
+        first.payload.keys.push(key.clone());
+        server.sync(&mut first);
+        server.sync(&mut second);
+        assert_eq!(second.get_key(key.id).unwrap().public_key, PUBLIC);
+        assert!(!second.has_unsynced_changes());
+
+        // A key from an older build: filled on unlock, but not sent as an edit.
+        first.payload.keys[0].public_key.clear();
+        let hash = first.payload.record(key.id).unwrap().hash();
+        first
+            .payload
+            .sync
+            .as_mut()
+            .unwrap()
+            .personal
+            .items
+            .get_mut(&key.id)
+            .unwrap()
+            .hash = hash;
+        first.payload.fill_public_keys();
+        assert_eq!(first.get_key(key.id).unwrap().public_key, PUBLIC);
+        assert!(!first.has_unsynced_changes());
+    }
+
+    #[test]
     fn an_older_local_edit_gives_way_to_the_server() {
         let dir = tempfile::tempdir().unwrap();
         let mut first = synced_vault(&dir, "first.bin");
@@ -2640,6 +2785,37 @@ mod tests {
         server.sync(&mut second);
 
         assert_eq!(labels(&second), ["edited"]);
+        assert!(!second.has_unsynced_changes());
+    }
+
+    #[test]
+    fn a_host_edited_here_and_deleted_there_comes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = synced_vault(&dir, "first.bin");
+        let mut second = second_device(&dir, &first);
+        let mut server = FakeServer::default();
+
+        let web = host("web");
+        first.add_entry(web.clone()).unwrap();
+        server.sync(&mut first);
+        server.sync(&mut second);
+
+        first.delete_entry(web.id).unwrap();
+        second
+            .update_entry(ServerEntry {
+                label: "edited".into(),
+                updated_at: 9,
+                ..web.clone()
+            })
+            .unwrap();
+        server.sync(&mut first);
+        server.sync(&mut second);
+        assert_eq!(labels(&second), ["edited"]);
+        server.sync(&mut second);
+        server.sync(&mut first);
+
+        assert_eq!(labels(&first), ["edited"]);
+        assert!(!first.has_unsynced_changes());
         assert!(!second.has_unsynced_changes());
     }
 
@@ -2839,6 +3015,8 @@ mod tests {
             key_type: String::new(),
             pem: "pem".into(),
             passphrase: None,
+            public_key: String::new(),
+            updated_at: 0,
         });
         let with_key = ServerEntry {
             auth: AuthMethod::PrivateKey { key_id },
@@ -2857,6 +3035,54 @@ mod tests {
         // Once the key is in the team's vault there is nothing left to announce.
         vault.update_entry(with_key.clone()).unwrap();
         assert!(vault.key_shared_by_saving(&with_key).is_none());
+    }
+
+    #[test]
+    fn sharing_a_host_copies_a_key_other_personal_hosts_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = synced_vault(&dir, "first.bin");
+        let (team, team_vault) = (Uuid::new_v4(), Uuid::new_v4());
+        join_team(&mut vault, team, &[(team_vault, None)]);
+        let key_id = Uuid::new_v4();
+        vault.payload.keys.push(SshKey {
+            id: key_id,
+            name: "deploy".into(),
+            created_at: 0,
+            fingerprint: String::new(),
+            key_type: String::new(),
+            pem: "pem".into(),
+            passphrase: None,
+            public_key: String::new(),
+            updated_at: 0,
+        });
+        let with_key = |label| ServerEntry {
+            auth: AuthMethod::PrivateKey { key_id },
+            ..host(label)
+        };
+        let (a, b) = (with_key("a"), with_key("b"));
+        vault.add_entry(a.clone()).unwrap();
+        vault.add_entry(b.clone()).unwrap();
+
+        vault.share_entry(a.id, team_vault).unwrap();
+
+        assert_eq!(vault.vault_of(key_id), None);
+        let key_of = |id| match vault.get_entry(id).unwrap().auth {
+            AuthMethod::PrivateKey { key_id } => key_id,
+            _ => panic!("host lost its key"),
+        };
+        assert_eq!(key_of(b.id), key_id);
+        let copy_id = key_of(a.id);
+        assert_ne!(copy_id, key_id);
+        assert_eq!(vault.vault_of(copy_id), Some(team_vault));
+
+        // The last host to follow takes the copy already there, not a second key.
+        vault.share_entry(b.id, team_vault).unwrap();
+        let key_of = |id| match vault.get_entry(id).unwrap().auth {
+            AuthMethod::PrivateKey { key_id } => key_id,
+            _ => panic!("host lost its key"),
+        };
+        assert_eq!(key_of(b.id), copy_id);
+        assert_eq!(vault.vault_of(key_id), None);
     }
 
     #[test]

@@ -364,6 +364,12 @@ pub struct SshKey {
     pub key_type: String,
     pub pem: String,
     pub passphrase: Option<String>,
+    /// "<type> <base64>" with no comment, always derived from `pem` here: a synced one is not
+    /// trusted. Empty in keys saved before it was stored, until the next unlock.
+    #[serde(default)]
+    pub public_key: String,
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 impl fmt::Debug for SshKey {
@@ -701,6 +707,35 @@ impl From<&ServerEntry> for ServerEntrySummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_from_an_older_build_reads_without_its_new_fields() {
+        #[derive(Serialize)]
+        struct OldSshKey {
+            id: Uuid,
+            name: String,
+            created_at: u64,
+            fingerprint: String,
+            key_type: String,
+            pem: String,
+            passphrase: Option<String>,
+        }
+        let old = OldSshKey {
+            id: Uuid::new_v4(),
+            name: "deploy".into(),
+            created_at: 1,
+            fingerprint: String::new(),
+            key_type: String::new(),
+            pem: "pem".into(),
+            passphrase: None,
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&old, &mut bytes).unwrap();
+        let key: SshKey = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(key.name, "deploy");
+        assert!(key.public_key.is_empty());
+        assert_eq!(key.updated_at, 0);
+    }
 
     /// Snippet shape written by builds that still had workflows.
     #[derive(Serialize)]

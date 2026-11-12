@@ -371,6 +371,18 @@ fn is_refusal_of_one_team(error: &ApiError) -> bool {
     ) && !error.is_session_ended()
 }
 
+/// In the roster but not on the team. The owner and this account are never listed:
+/// neither can be removed.
+fn left_members(roster: &Roster, present: &[Uuid], me: Uuid) -> Vec<Uuid> {
+    roster
+        .members
+        .iter()
+        .map(|m| m.user_id)
+        .filter(|id| !present.contains(id))
+        .filter(|id| *id != me && Some(*id) != roster.owner())
+        .collect()
+}
+
 fn check_team(
     api: &Api,
     context: &TeamContext,
@@ -449,12 +461,7 @@ fn check_team(
         .iter()
         .map(|member| member.user_id)
         .collect();
-    let left = roster
-        .members
-        .iter()
-        .map(|m| m.user_id)
-        .filter(|id| !present.contains(id))
-        .collect();
+    let left = left_members(&roster, &present, context.user_id);
     let logins = details
         .members
         .into_iter()
@@ -1191,6 +1198,21 @@ mod tests {
             signature: submission.signature,
             signer_user_id: signer_id,
         }
+    }
+
+    #[test]
+    fn the_owner_and_this_account_never_count_as_left() {
+        let (owner_id, me, gone) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (mut roster, _) = first_roster(&keys(1), owner_id);
+        for user_id in [me, gone] {
+            roster.members.push(RosterMember {
+                user_id,
+                role: "member".into(),
+                ..roster.members[0].clone()
+            });
+        }
+        assert_eq!(left_members(&roster, &[], me), [gone]);
+        assert!(left_members(&roster, &[gone], me).is_empty());
     }
 
     #[test]

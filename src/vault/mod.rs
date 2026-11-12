@@ -901,8 +901,8 @@ impl VaultManager {
         pem: String,
         passphrase: Option<String>,
     ) -> Result<Uuid, VaultError> {
-        let (fingerprint, key_type) = derive_key_metadata(&pem, passphrase.as_deref())?;
-        self.push_key(name, pem, passphrase, fingerprint, key_type)
+        let metadata = derive_key_metadata(&pem, passphrase.as_deref())?;
+        self.push_key(name, pem, passphrase, metadata)
     }
 
     fn push_key(
@@ -910,18 +910,20 @@ impl VaultManager {
         name: String,
         pem: String,
         passphrase: Option<String>,
-        fingerprint: String,
-        key_type: String,
+        metadata: KeyMetadata,
     ) -> Result<Uuid, VaultError> {
         let id = Uuid::new_v4();
+        let now = unix_now();
         self.payload.keys.push(SshKey {
             id,
             name,
-            created_at: unix_now(),
-            fingerprint,
-            key_type,
+            created_at: now,
+            fingerprint: metadata.fingerprint,
+            key_type: metadata.key_type,
             pem,
             passphrase,
+            public_key: metadata.public_key,
+            updated_at: now as i64,
         });
         self.save()?;
         Ok(id)
@@ -936,16 +938,16 @@ impl VaultManager {
         passphrase: Option<String>,
     ) -> Result<Uuid, VaultError> {
         // Reading a key with a passphrase is slow, so do it once here, not again in `add_key`.
-        let (fingerprint, key_type) = derive_key_metadata(&pem, passphrase.as_deref())?;
+        let metadata = derive_key_metadata(&pem, passphrase.as_deref())?;
         if let Some(existing) = self
             .payload
             .keys
             .iter()
-            .find(|k| k.fingerprint == fingerprint)
+            .find(|k| k.fingerprint == metadata.fingerprint)
         {
             return Ok(existing.id);
         }
-        self.push_key(name, pem, passphrase, fingerprint, key_type)
+        self.push_key(name, pem, passphrase, metadata)
     }
 
     pub fn rename_key(&mut self, id: Uuid, new_name: String) -> Result<(), VaultError> {
@@ -956,6 +958,7 @@ impl VaultManager {
             .find(|k| k.id == id)
             .ok_or(VaultError::KeyNotFound(id))?;
         key.name = new_name;
+        key.updated_at = unix_now() as i64;
         self.save()
     }
 
@@ -1383,8 +1386,9 @@ impl VaultManager {
         kdf_params: KdfParams,
         enc_dek_by_password: AeadBlob,
         enc_dek_by_recovery: AeadBlob,
-        payload: VaultPayload,
+        mut payload: VaultPayload,
     ) -> Self {
+        payload.fill_public_keys();
         let boxed = Box::new(*dek);
         memory::lock_memory(boxed.as_ref().as_ptr(), 32);
 
@@ -1451,19 +1455,36 @@ impl VaultManager {
     }
 }
 
-fn derive_key_metadata(
-    pem: &str,
-    passphrase: Option<&str>,
-) -> Result<(String, String), VaultError> {
+struct KeyMetadata {
+    fingerprint: String,
+    key_type: String,
+    public_key: String,
+}
+
+fn derive_key_metadata(pem: &str, passphrase: Option<&str>) -> Result<KeyMetadata, VaultError> {
+    use keys::PublicKeyBase64;
     let pass_str = passphrase.filter(|p| !p.is_empty());
     let key_pair = keys::decode_secret_key(pem, pass_str)
         .map_err(|e| VaultError::InvalidKey(e.to_string()))?;
     let pub_key = key_pair
         .clone_public_key()
         .map_err(|e| VaultError::InvalidKey(e.to_string()))?;
-    let fingerprint = format!("SHA256:{}", pub_key.fingerprint());
-    let key_type = key_type_display(&key_pair, &pub_key);
-    Ok((fingerprint, key_type))
+    Ok(KeyMetadata {
+        fingerprint: format!("SHA256:{}", pub_key.fingerprint()),
+        key_type: key_type_display(&key_pair, &pub_key),
+        public_key: format!("{} {}", pub_key.name(), pub_key.public_key_base64()),
+    })
+}
+
+/// Sets `public_key` from the pem, or clears it when the pem cannot be read.
+fn fill_public_key(key: &mut SshKey) {
+    key.public_key = match derive_key_metadata(&key.pem, key.passphrase.as_deref()) {
+        Ok(metadata) => metadata.public_key,
+        Err(e) => {
+            tracing::warn!(id = %key.id, ?e, "could not read the public key");
+            String::new()
+        }
+    };
 }
 
 fn key_type_display(pair: &keys::key::KeyPair, pub_key: &keys::key::PublicKey) -> String {
@@ -2758,6 +2779,33 @@ mod tests {
 
         let vm2 = VaultManager::unlock_with_password(&vault_path, &pw("pw")).unwrap();
         assert_eq!(vm2.list_entries().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_key_saved_without_its_public_key_gets_it_on_unlock() {
+        const PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACBSrT4gKjhtn5u267EcdofVgSVUGF0Yo4EtvpThw90uNQAAAIhrUZbMa1GW
+zAAAAAtzc2gtZWQyNTUxOQAAACBSrT4gKjhtn5u267EcdofVgSVUGF0Yo4EtvpThw90uNQ
+AAAEA9LGAPFGzV6Uf63tOpOfBPj4rCccBhAWtYOhbYqNdHcVKtPiAqOG2fm7brsRx2h9WB
+JVQYXRijgS2+lOHD3S41AAAAAAECAwQF
+-----END OPENSSH PRIVATE KEY-----
+";
+        const PUBLIC: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFKtPiAqOG2fm7brsRx2h9WBJVQYXRijgS2+lOHD3S41";
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("vault.bin");
+        let (mut vm, _) =
+            VaultManager::create_with_params(&vault_path, &pw("pw"), fast_kdf()).unwrap();
+        let id = vm.add_key("deploy".into(), PEM.into(), None).unwrap();
+        assert_eq!(vm.get_key(id).unwrap().public_key, PUBLIC);
+
+        vm.payload.keys[0].public_key.clear();
+        vm.save().unwrap();
+        vm.lock();
+
+        let vm = VaultManager::unlock_with_password(&vault_path, &pw("pw")).unwrap();
+        assert_eq!(vm.get_key(id).unwrap().public_key, PUBLIC);
     }
 
     #[test]
