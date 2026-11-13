@@ -47,9 +47,13 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// Round-trips dominate for small files, so overlap is the main speed lever.
 const FOLDER_FILE_CONCURRENCY: usize = 16;
 
-/// Files of a folder upload that send a chunk at once. Each chunk must be answered
+/// Full chunks of a folder upload in flight at once. Each chunk must be answered
 /// within the 10 s SFTP timeout, counted from queueing, so a slow uplink needs few.
 const FOLDER_WRITE_CONCURRENCY: usize = 4;
+
+/// Write slots are counted in pieces of this size, so small files do not take a
+/// whole chunk's slot and many of them can be written at once.
+const WRITE_SLOT_BYTES: usize = 16 * 1024;
 
 /// Tracked transfers (drag/drop, menu) that run at once on one SFTP channel;
 /// the rest wait their turn. They share one link, so more would not be faster.
@@ -671,7 +675,7 @@ impl TransferTrack {
         let cancel = track.map(|t| t.cancel.clone()).unwrap_or_default();
         Self {
             write_slots: Some(Arc::new(tokio::sync::Semaphore::new(
-                FOLDER_WRITE_CONCURRENCY,
+                FOLDER_WRITE_CONCURRENCY * TRANSFER_CHUNK / WRITE_SLOT_BYTES,
             ))),
             ..Self::new(track.map(|t| t.id).unwrap_or(0), cancel)
         }
@@ -701,6 +705,8 @@ impl SshConnection {
     pub fn spawn(route: SshRoute) -> Self {
         let (cmd_tx, cmd_rx) = async_channel::bounded::<SshCmd>(8);
         let (event_tx, event_rx) = async_channel::bounded::<SshConnectionEvent>(8);
+        // Weak, so the thread's own copy does not keep the connection open.
+        let self_tx = cmd_tx.downgrade();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -708,7 +714,7 @@ impl SshConnection {
                 .build()
                 .expect("tokio runtime");
             let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, run_connection(route, cmd_rx, event_tx));
+            local.block_on(&rt, run_connection(route, cmd_rx, self_tx, event_tx));
         });
 
         Self { cmd_tx, event_rx }
@@ -782,6 +788,8 @@ impl SshConnection {
 pub struct SftpHandle {
     cmd_tx: async_channel::Sender<SftpCmd>,
     event_rx: async_channel::Receiver<SftpEvent>,
+    /// The SSH connection the channel runs on, for commands like `rm -rf`.
+    connection: async_channel::WeakSender<SshCmd>,
 }
 
 impl SftpHandle {
@@ -1101,6 +1109,9 @@ impl SftpHandle {
     /// SFTP rmdir only removes empty directories, so this deletes files first,
     /// then directories bottom-up.
     pub async fn remove_dir_recursive(&self, root: String) -> anyhow::Result<()> {
+        if self.remove_dir_by_command(&root).await {
+            return Ok(());
+        }
         // BFS to collect the tree: files at any depth, dirs per level.
         let mut dirs_by_depth: Vec<Vec<String>> = vec![vec![root]];
         let mut files: Vec<String> = Vec::new();
@@ -1134,11 +1145,50 @@ impl SftpHandle {
         }
         Ok(())
     }
+
+    /// `rm -rf` on the server: one round-trip instead of one per file. False when
+    /// the server runs no commands or `rm` failed, so the SFTP walk can report why.
+    async fn remove_dir_by_command(&self, root: &str) -> bool {
+        const DONE: &str = "flint-rm-done";
+        let Some(connection) = self.connection.upgrade() else {
+            return false;
+        };
+        let cmd = format!(
+            "rm -rf -- {} && echo {DONE}",
+            crate::shell::shell_quote(root)
+        );
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let sent = connection
+            .send(SshCmd::OpenExec {
+                cmd,
+                reply: reply_tx,
+            })
+            .await;
+        drop(connection);
+        if sent.is_err() {
+            return false;
+        }
+        let Ok(Ok(exec)) = reply_rx.await else {
+            return false;
+        };
+        let output = exec.subscribe();
+        let mut bytes = Vec::new();
+        // The channel closes when the command exits.
+        while let Ok(chunk) = output.recv().await {
+            bytes.extend_from_slice(&chunk);
+        }
+        let is_done = String::from_utf8_lossy(&bytes).contains(DONE);
+        if !is_done {
+            tracing::info!(root, "rm -rf did not finish, deleting over SFTP");
+        }
+        is_done
+    }
 }
 
 async fn run_connection(
     route: SshRoute,
     cmd_rx: async_channel::Receiver<SshCmd>,
+    self_tx: async_channel::WeakSender<SshCmd>,
     event_tx: async_channel::Sender<SshConnectionEvent>,
 ) {
     let host = route.target.host.clone();
@@ -1194,7 +1244,7 @@ async fn run_connection(
                 let Ok(cmd) = cmd else { break };
                 match cmd {
                     SshCmd::OpenSftpChannel { reply } => {
-                        let _ = reply.send(open_sftp_channel(&handle).await);
+                        let _ = reply.send(open_sftp_channel(&handle, self_tx.clone()).await);
                     }
                     SshCmd::OpenShellChannel { rows, cols, reply } => {
                         let _ = reply.send(open_shell_channel(&handle, rows, cols).await);
@@ -1505,6 +1555,7 @@ fn match_inbound<'a>(
 
 async fn open_sftp_channel(
     handle: &client::Handle<ClientHandler>,
+    connection: async_channel::WeakSender<SshCmd>,
 ) -> Result<(SftpHandle, String), SshError> {
     let channel = handle
         .channel_open_session()
@@ -1536,6 +1587,7 @@ async fn open_sftp_channel(
         SftpHandle {
             cmd_tx: sftp_cmd_tx,
             event_rx: sftp_event_rx,
+            connection,
         },
         home_dir,
     ))
@@ -2394,7 +2446,7 @@ async fn connect_tcp(
     port: u16,
     proxy: Option<&ResolvedProxy>,
 ) -> Result<tokio::net::TcpStream, AuthError> {
-    tokio::time::timeout(TCP_CONNECT_TIMEOUT, async {
+    let stream = tokio::time::timeout(TCP_CONNECT_TIMEOUT, async {
         match proxy {
             None => tokio::net::TcpStream::connect((host, port))
                 .await
@@ -2408,7 +2460,12 @@ async fn connect_tcp(
             "timed out after {}s",
             TCP_CONNECT_TIMEOUT.as_secs()
         ))
-    })?
+    })??;
+    // Without it Nagle holds a keystroke until a running upload's data is acked.
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::warn!(%e, host, "could not set TCP_NODELAY");
+    }
+    Ok(stream)
 }
 
 /// Only an explicit "forwarding is not allowed" is permanent. Anything else may
@@ -4165,7 +4222,7 @@ async fn copy_to_remote(
         let _write_slot = match write_slots {
             Some(slots) => Some(
                 slots
-                    .acquire()
+                    .acquire_many(write_slot_count(n))
                     .await
                     .expect("the write semaphore is never closed"),
             ),
@@ -4179,6 +4236,10 @@ async fn copy_to_remote(
     }
     remote_file.shutdown().await?;
     Ok(written)
+}
+
+fn write_slot_count(bytes: usize) -> u32 {
+    bytes.div_ceil(WRITE_SLOT_BYTES).max(1) as u32
 }
 
 /// Move a finished part file to its real name.
@@ -5145,7 +5206,16 @@ mod tests {
         // Only the files of a folder take turns to write.
         assert!(track.write_slots.is_none());
         let slots = files_track.write_slots.as_ref().unwrap();
-        assert_eq!(slots.available_permits(), FOLDER_WRITE_CONCURRENCY);
+        // A full chunk takes its share, so FOLDER_WRITE_CONCURRENCY of them fit.
+        let full_chunk = write_slot_count(TRANSFER_CHUNK) as usize;
+        assert_eq!(
+            slots.available_permits() / full_chunk,
+            FOLDER_WRITE_CONCURRENCY
+        );
+        // A small file takes one piece, so it does not block a chunk's worth.
+        assert_eq!(write_slot_count(0), 1);
+        assert_eq!(write_slot_count(2000), 1);
+        assert_eq!(write_slot_count(WRITE_SLOT_BYTES + 1), 2);
 
         files_track
             .has_failed_sibling

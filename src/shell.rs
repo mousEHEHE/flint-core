@@ -491,7 +491,7 @@ fn is_shown(window: &watch::Receiver<bool>, tab: &watch::Receiver<bool>) -> bool
 
 /// One shell word for POSIX shells, fish and csh. `'`, `\` and `!` go outside the quotes:
 /// fish reads `\` in single quotes as an escape, and csh expands `!` history in them.
-fn shell_quote(text: &str) -> String {
+pub(crate) fn shell_quote(text: &str) -> String {
     let mut quoted = String::with_capacity(text.len() + 2);
     quoted.push('\'');
     for character in text.chars() {
