@@ -26,12 +26,14 @@ impl RecoveryPhrase {
 
     /// Only 24-word phrases are accepted.
     pub fn from_words(s: &str) -> Result<Self, VaultError> {
+        // The word list is lowercase; phones capitalize the first word on their own.
+        let s = Zeroizing::new(s.to_lowercase());
         let word_count = s.split_whitespace().count();
         if word_count != 24 {
             return Err(VaultError::InvalidRecoveryPhrase);
         }
 
-        Mnemonic::parse_normalized(s)
+        Mnemonic::parse_normalized(&s)
             .map_err(|_| VaultError::InvalidRecoveryPhrase)
             .map(|m| Self(Secret::new(m.to_string())))
     }
@@ -126,6 +128,26 @@ mod tests {
         let twelve = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
         assert!(matches!(
             RecoveryPhrase::from_words(twelve),
+            Err(VaultError::InvalidRecoveryPhrase)
+        ));
+    }
+
+    #[test]
+    fn capital_letters_are_accepted() {
+        let (phrase, entropy) = RecoveryPhrase::generate();
+        let shouted = phrase.expose_words().to_uppercase();
+        let parsed = RecoveryPhrase::from_words(&shouted).unwrap();
+        assert_eq!(*parsed.to_bytes(), *entropy);
+    }
+
+    #[test]
+    fn rejects_24_words_with_a_bad_checksum() {
+        // The BIP39 vector for zero entropy ends in "art"; any other last word is wrong.
+        let valid = format!("{} art", ["abandon"; 23].join(" "));
+        assert!(RecoveryPhrase::from_words(&valid).is_ok());
+        let broken = ["abandon"; 24].join(" ");
+        assert!(matches!(
+            RecoveryPhrase::from_words(&broken),
             Err(VaultError::InvalidRecoveryPhrase)
         ));
     }

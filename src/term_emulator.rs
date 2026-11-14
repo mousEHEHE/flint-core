@@ -48,6 +48,16 @@ struct SimpleDims {
     cols: u16,
 }
 
+impl SimpleDims {
+    /// alacritty assumes two columns: a wide character at one column indexes past the row.
+    fn clamped(rows: u16, cols: u16) -> Self {
+        Self {
+            rows: rows.max(1),
+            cols: cols.max(2),
+        }
+    }
+}
+
 impl Dimensions for SimpleDims {
     fn total_lines(&self) -> usize {
         self.rows as usize
@@ -64,7 +74,7 @@ impl Dimensions for SimpleDims {
 
 impl TermEmulator {
     pub fn new(rows: u16, cols: u16) -> Self {
-        let dims = SimpleDims { rows, cols };
+        let dims = SimpleDims::clamped(rows, cols);
         let config = Config {
             scrolling_history: SCROLLBACK_LINES,
             ..Config::default()
@@ -130,7 +140,7 @@ impl TermEmulator {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.term.resize(SimpleDims { rows, cols });
+        self.term.resize(SimpleDims::clamped(rows, cols));
         // Reflow moves text between lines, so the match would point at other text.
         self.current_match = None;
     }
@@ -879,5 +889,13 @@ mod tests {
         // Two wide chars take four cells, starting after "x ".
         assert_eq!(matches[0].start.column, 2);
         assert_eq!(matches[0].end.column, 5);
+    }
+
+    #[test]
+    fn a_wide_character_on_a_one_column_terminal_does_not_panic() {
+        let mut term = TermEmulator::new(1, 1);
+        term.advance("日本".as_bytes());
+        term.resize(0, 0);
+        term.advance("日本".as_bytes());
     }
 }
