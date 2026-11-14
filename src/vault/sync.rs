@@ -457,12 +457,12 @@ impl VaultPayload {
     /// Give a host or key the id `new` and repoint what referred to it. Hosts in
     /// `still_shared` are not repointed: a personal copy would break them for the team.
     fn give_new_id(&mut self, old: Uuid, new: Uuid, still_shared: &BTreeSet<Uuid>) {
-        // A copy exists already (another device, or an earlier loss): keep it, drop this one.
-        let is_kept_already =
-            self.keys.iter().any(|key| key.id == new) || self.entries.iter().any(|e| e.id == new);
-        if is_kept_already {
-            self.keys.retain(|key| key.id != old);
-            self.entries.retain(|entry| entry.id != old);
+        // A copy exists already (another device, or an earlier loss): keep the newer of the two.
+        // An edit here not yet pushed then goes on top of the copy.
+        if let (Some(mine), Some(copy)) = (self.updated_at(old), self.updated_at(new)) {
+            let dropped = if mine > copy { new } else { old };
+            self.keys.retain(|key| key.id != dropped);
+            self.entries.retain(|entry| entry.id != dropped);
         }
         for key in &mut self.keys {
             if key.id == old {
@@ -488,6 +488,13 @@ impl VaultPayload {
                 *id = new;
             }
         }
+    }
+
+    fn updated_at(&self, id: Uuid) -> Option<i64> {
+        let key = self.keys.iter().find(|key| key.id == id);
+        let entry = self.entries.iter().find(|entry| entry.id == id);
+        key.map(|key| key.updated_at)
+            .or_else(|| entry.map(|entry| entry.updated_at))
     }
 
     /// Whether a folder or tag is still in use here.
@@ -605,16 +612,32 @@ fn outgoing(
     changes
 }
 
+/// A skipped item still moves the known rev, so a local edit pushes on top of it instead of
+/// conflicting every round.
+fn skip(ledger: &mut Ledger, item: &PulledItem) {
+    if let Some(known) = ledger.items.get_mut(&item.id) {
+        known.rev = item.rev;
+    }
+}
+
 /// Re-encrypt a team vault item under the next key. One that does not open becomes a
 /// deletion: any member can write a broken item, and it must not block a key change.
-pub fn reseal_item(old_key: &[u8; 32], new_key: &[u8; 32], id: Uuid, blob: &[u8]) -> Vec<u8> {
+/// Also returns whether the new item is a deletion.
+pub fn reseal_item(
+    old_key: &[u8; 32],
+    new_key: &[u8; 32],
+    id: Uuid,
+    blob: &[u8],
+    is_deleted: bool,
+) -> (Vec<u8>, bool) {
     let old_item_key = crypto::derive_subkey(old_key, ITEM_KEY_PURPOSE);
     let new_item_key = crypto::derive_subkey(new_key, ITEM_KEY_PURPOSE);
     let record = Record::open(&old_item_key, id, blob).unwrap_or_else(|| {
         tracing::warn!(%id, "an item does not open under the old team key and is dropped");
         Record::Deleted
     });
-    record.seal(&new_item_key, id)
+    let is_deleted = is_deleted || matches!(record, Record::Deleted);
+    (record.seal(&new_item_key, id), is_deleted)
 }
 
 fn shared_entry(entry: &ServerEntry) -> Record {
@@ -961,6 +984,7 @@ impl VaultManager {
     ) -> bool {
         let Some(mut theirs) = Record::open(item_key, item.id, &item.blob) else {
             tracing::warn!(id = %item.id, "skipping a synced item this build cannot read");
+            skip(ledger, item);
             return false;
         };
         // Never trusted as sent: it goes into authorized_keys, so it must match the pem.
@@ -971,11 +995,13 @@ impl VaultManager {
         // The flag is unencrypted and the server could set it; only the sealed marker deletes.
         if item.is_deleted != matches!(theirs, Record::Deleted) {
             tracing::warn!(id = %item.id, "skipping a synced item whose deleted flag does not match it");
+            skip(ledger, item);
             return false;
         }
         // A team vault holds hosts and their keys, nothing else.
         if scope.is_some() && !matches!(theirs, Record::Entry(_) | Record::Key(_) | Record::Deleted)
         {
+            skip(ledger, item);
             return false;
         }
         let mine = self.payload.record(item.id);
@@ -2382,6 +2408,84 @@ mod tests {
                 .id
         };
         assert_eq!(copy(&first), copy(&second));
+    }
+
+    #[test]
+    fn an_unpushed_edit_wins_over_the_copy_another_device_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let TwoDevices {
+            mut first,
+            mut second,
+            mut servers_of,
+            team,
+            general,
+            servers,
+            db,
+            ..
+        } = two_devices(&dir);
+        let vaults = [(general, None), (servers, Some("Servers"))];
+
+        see_team(&mut first, team, &vaults, &[general]);
+        servers_of.sync(&mut first);
+        servers_of.sync(&mut second);
+        let edited = ServerEntry {
+            label: "db edited".into(),
+            updated_at: 9,
+            ..db
+        };
+        second.update_entry(edited).unwrap();
+        see_team(&mut second, team, &vaults, &[general]);
+        servers_of.sync(&mut second);
+        servers_of.sync(&mut first);
+
+        for vault in [&first, &second] {
+            assert_eq!(labels(vault), ["db edited", "web"]);
+            assert!(!vault.has_unsynced_changes());
+        }
+    }
+
+    #[test]
+    fn a_skipped_server_item_does_not_make_a_local_edit_conflict_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = synced_vault(&dir, "first.bin");
+        let mut server = FakeServer::default();
+        let web = host("web");
+        first.add_entry(web.clone()).unwrap();
+        server.sync(&mut first);
+        // Another device writes something this build cannot open.
+        server.latest_rev += 1;
+        let item = server.items.get_mut(&web.id).unwrap();
+        item.rev = server.latest_rev;
+        item.blob = b"not a sealed record".to_vec();
+        first
+            .update_entry(ServerEntry {
+                label: "edited".into(),
+                updated_at: 9,
+                ..web
+            })
+            .unwrap();
+
+        server.sync(&mut first);
+        assert_eq!(first.begin_sync()[0].changes[0].base_rev, 2);
+        server.sync(&mut first);
+
+        assert!(!first.has_unsynced_changes());
+        assert_eq!(server.items[&web.id].rev, 3);
+    }
+
+    #[test]
+    fn an_item_that_does_not_open_is_resealed_as_a_deletion() {
+        let id = Uuid::new_v4();
+        let (old_key, new_key) = ([1; 32], [2; 32]);
+        let new_item_key = crypto::derive_subkey(&new_key, ITEM_KEY_PURPOSE);
+
+        let (blob, is_deleted) = reseal_item(&old_key, &new_key, id, b"broken", false);
+
+        assert!(is_deleted);
+        assert!(matches!(
+            Record::open(&new_item_key, id, &blob),
+            Some(Record::Deleted)
+        ));
     }
 
     #[test]

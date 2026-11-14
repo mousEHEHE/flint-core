@@ -904,7 +904,8 @@ pub struct RosterSubmission {
 pub struct Rotation {
     pub vault_id: Uuid,
     pub base_rev: u64,
-    pub items: Vec<(Uuid, Vec<u8>)>,
+    /// Id, blob, and whether it is a deletion.
+    pub items: Vec<(Uuid, Vec<u8>, bool)>,
 }
 
 impl RosterSubmission {
@@ -923,7 +924,9 @@ impl RosterSubmission {
                 let items: Vec<Value> = rotation
                     .items
                     .iter()
-                    .map(|(id, blob)| json!({ "id": id, "blob": BASE64.encode(blob) }))
+                    .map(|(id, blob, is_deleted)| {
+                        json!({ "id": id, "blob": BASE64.encode(blob), "is_deleted": is_deleted })
+                    })
                     .collect();
                 json!({ "vault_id": rotation.vault_id, "base_rev": rotation.base_rev, "items": items })
             })

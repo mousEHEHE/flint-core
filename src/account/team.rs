@@ -12,7 +12,9 @@ use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
-use super::api::{Api, ApiError, JoinRequest, RosterSubmission, Rotation, SignedRoster};
+use super::api::{
+    Api, ApiError, JoinRequest, RosterSubmission, Rotation, SignedRoster, TeamDetails,
+};
 use crate::vault::crypto;
 use crate::vault::format::AeadBlob;
 use crate::vault::sync::{
@@ -390,15 +392,26 @@ fn check_team(
     team_id: Uuid,
     name: String,
 ) -> Result<Option<TeamUpdate>, TeamError> {
-    let bad = TeamError::Untrusted;
     let token = &context.session_token;
     let details = api.team(token, team_id)?;
     let chain = api.rosters(token, team_id)?;
+    check_fetched_team(context, keys, team_id, name, details, &chain)
+}
 
+/// The checks of `check_team` on what the server sent.
+fn check_fetched_team(
+    context: &TeamContext,
+    keys: &TeamKeys,
+    team_id: Uuid,
+    name: String,
+    details: TeamDetails,
+    chain: &[SignedRoster],
+) -> Result<Option<TeamUpdate>, TeamError> {
+    let bad = TeamError::Untrusted;
     let Some(start) = find_anchor(
         context,
         team_id,
-        &chain,
+        chain,
         details.join_confirmation.as_deref(),
     )?
     else {
@@ -1045,8 +1058,9 @@ fn reencrypt(
             return Err(ApiError::BadAnswer.into());
         }
         for item in &page.items {
-            let blob = sync::reseal_item(&old.key, &new.key, item.id, &item.blob);
-            rotation.items.push((item.id, blob));
+            let (blob, is_deleted) =
+                sync::reseal_item(&old.key, &new.key, item.id, &item.blob, item.is_deleted);
+            rotation.items.push((item.id, blob, is_deleted));
             rotation.base_rev = item.rev;
         }
         if !page.has_more {
@@ -1372,6 +1386,129 @@ mod tests {
             },
             member_id,
         )
+    }
+
+    fn with_admin(owner: &TeamKeys, admin: &TeamKeys) -> (Roster, Vec<u8>, Uuid, Uuid) {
+        let (owner_id, admin_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mut first, _) = first_roster(owner, owner_id);
+        first.members.push(RosterMember {
+            user_id: admin_id,
+            sign_key: BASE64.encode(admin.sign_key()),
+            box_key: BASE64.encode(admin.box_key()),
+            role: "admin".into(),
+            vault_ids: Vec::new(),
+        });
+        let body = first.to_bytes();
+        (first, body, owner_id, admin_id)
+    }
+
+    fn following(first: &Roster, body: &[u8]) -> Roster {
+        let mut next = first.clone();
+        next.seq = 2;
+        next.prev_hash = Some(hex(&hash(body)));
+        next
+    }
+
+    #[test]
+    fn an_admin_cannot_hand_the_team_over() {
+        let (owner, admin) = (keys(1), keys(2));
+        let (first, body, _, admin_id) = with_admin(&owner, &admin);
+        let mut next = following(&first, &body);
+        next.members[0].role = "admin".into();
+        next.members[1].role = "owner".into();
+
+        assert!(verify_next(&first, &body, &signed(&admin, admin_id, &next)).is_err());
+        // The same admin may still sign a roster that keeps the owner.
+        let kept = following(&first, &body);
+        assert!(verify_next(&first, &body, &signed(&admin, admin_id, &kept)).is_ok());
+    }
+
+    #[test]
+    fn a_roster_needs_exactly_one_owner() {
+        let (owner, admin) = (keys(1), keys(2));
+        let (first, body, owner_id, _) = with_admin(&owner, &admin);
+        let mut none = following(&first, &body);
+        none.members[0].role = "admin".into();
+        let mut two = following(&first, &body);
+        two.members[1].role = "owner".into();
+
+        assert!(verify_next(&first, &body, &signed(&owner, owner_id, &none)).is_err());
+        assert!(verify_next(&first, &body, &signed(&owner, owner_id, &two)).is_err());
+    }
+
+    /// The owner's view of a one-roster team, the roster pinned, with `wrapped` as its keys.
+    fn fetched(
+        owner: &TeamKeys,
+        wrapped: impl Fn(&VaultKey) -> VaultKey,
+    ) -> (TeamContext, TeamDetails, Vec<SignedRoster>) {
+        let (mut context, team, _) = two_vault_team(owner, &keys(2));
+        let team_id = team.roster.team_id;
+        context.pins.push(TeamPin {
+            team_id,
+            seq: 1,
+            hash: hash(&team.body),
+        });
+        let details = TeamDetails {
+            members: Vec::new(),
+            my_vault_keys: team
+                .vault_keys
+                .iter()
+                .map(|key| crate::account::api::WrappedVaultKey {
+                    vault_id: key.vault_id,
+                    key_version: 1,
+                    wrapped_key: wrap_key(&owner.box_key(), context.user_id, &wrapped(key)),
+                })
+                .collect(),
+            join_confirmation: None,
+        };
+        let chain = vec![signed(owner, context.user_id, &team.roster)];
+        (context, details, chain)
+    }
+
+    #[test]
+    fn a_fetched_team_with_the_named_keys_passes() {
+        let owner = keys(1);
+        let (context, details, chain) = fetched(&owner, VaultKey::clone);
+        let team_id = Roster::parse(&chain[0].body).unwrap().team_id;
+
+        let update = check_fetched_team(&context, &owner, team_id, "ops".into(), details, &chain);
+
+        assert_eq!(update.unwrap().unwrap().vaults.len(), 2);
+    }
+
+    #[test]
+    fn a_vault_key_other_than_the_roster_names_is_refused() {
+        let owner = keys(1);
+        let (context, details, chain) = fetched(&owner, |key| VaultKey {
+            key: [3; 32],
+            ..key.clone()
+        });
+        let team_id = Roster::parse(&chain[0].body).unwrap().team_id;
+
+        let update = check_fetched_team(&context, &owner, team_id, "ops".into(), details, &chain);
+
+        assert!(matches!(
+            update,
+            Err(TeamError::Untrusted(
+                "a vault key is not the one the roster names"
+            ))
+        ));
+    }
+
+    #[test]
+    fn a_roster_listing_this_account_with_other_keys_is_refused() {
+        let owner = keys(1);
+        let (context, details, chain) = fetched(&owner, VaultKey::clone);
+        let team_id = Roster::parse(&chain[0].body).unwrap().team_id;
+
+        let update = check_fetched_team(&context, &keys(3), team_id, "ops".into(), details, &chain);
+
+        assert!(matches!(
+            update,
+            Err(TeamError::Untrusted(
+                "the roster lists this account with other keys"
+            ))
+        ));
     }
 
     #[test]

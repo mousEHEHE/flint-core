@@ -180,9 +180,12 @@ pub fn take_in(vault: &mut VaultManager, round: Round) -> Result<(bool, bool), S
             Ok((false, false))
         }
         Round::Teams(_, Ok(Some(checked))) => {
-            saved(vault.apply_teams(checked.update))?;
-            // The items come next, in a round of their own.
-            Ok((true, true))
+            let update = checked.update;
+            let is_all_checked = update.listed.iter().all(|id| update.checked.contains(id));
+            saved(vault.apply_teams(update))?;
+            // The items come next, in a round of their own. A team that failed waits for the
+            // timer: its vault would 409 again and loop straight back here.
+            Ok((is_all_checked, true))
         }
         Round::Teams(_, Ok(None)) => {
             vault.forget_behind_on_teams();
@@ -525,6 +528,35 @@ mod tests {
 
         assert!(outcome.is_err());
         assert!(!vault.is_behind_on_teams());
+    }
+
+    fn teams_checked(listed: Vec<Uuid>, checked: Vec<Uuid>) -> Round {
+        let update = TeamsUpdate {
+            key_seed: None,
+            teams: Vec::new(),
+            known: Vec::new(),
+            listed,
+            checked,
+            closed_invites: Vec::new(),
+        };
+        let checked = TeamsChecked {
+            update,
+            join_requests: BTreeMap::new(),
+        };
+        Round::Teams("token".into(), Ok(Some(checked)))
+    }
+
+    #[test]
+    fn a_team_that_failed_its_check_waits_for_the_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut vault, _) = vault_in_a_team(&dir);
+        let (good, bad) = (Uuid::new_v4(), Uuid::new_v4());
+
+        let outcome = take_in(&mut vault, teams_checked(vec![good, bad], vec![good]));
+        assert_eq!(outcome, Ok((false, true)));
+
+        let outcome = take_in(&mut vault, teams_checked(vec![good], vec![good]));
+        assert_eq!(outcome, Ok((true, true)));
     }
 
     fn personal_job_at(cursor: u64) -> SyncJob {
