@@ -97,6 +97,12 @@ pub(crate) async fn run_listener(
                         tracing::debug!(id = %spec.id, %e, "dropped connection before accept");
                         continue;
                     }
+                    // Out of descriptors clears once live connections close.
+                    Err(e) if is_out_of_file_handles(&e) => {
+                        tracing::warn!(id = %spec.id, %e, "accept failed: out of file handles, retrying");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
                     Err(e) => {
                         tracing::warn!(id = %spec.id, %e, "forward listener stopped");
                         let _ = forward_tx.try_send(ForwardMsg::ListenerFailed {
@@ -117,6 +123,15 @@ pub(crate) async fn run_listener(
         }
     }
     tracing::debug!(id = %spec.id, "forward listener finished");
+}
+
+fn is_out_of_file_handles(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    return matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE));
+    #[cfg(windows)]
+    return e.raw_os_error() == Some(10024); // WSAEMFILE
+    #[cfg(not(any(unix, windows)))]
+    return false;
 }
 
 async fn handle_outbound(

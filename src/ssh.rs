@@ -1214,10 +1214,13 @@ async fn run_connection(
     // Credentials must not outlive authentication.
     drop(route);
     let ConnectedChain {
-        session: mut handle,
+        session: handle,
         disconnect_rx: disc_rx,
         jumps: _jumps,
     } = chain;
+    // Shared so a slow direct-tcpip open runs in its own task; only
+    // `tcpip_forward` needs the write lock.
+    let handle = std::rc::Rc::new(tokio::sync::RwLock::new(handle));
     tracing::info!(host, username, "ssh session authenticated");
     let _ = event_tx.send(SshConnectionEvent::Connected).await;
 
@@ -1244,22 +1247,23 @@ async fn run_connection(
                 let Ok(cmd) = cmd else { break };
                 match cmd {
                     SshCmd::OpenSftpChannel { reply } => {
-                        let _ = reply.send(open_sftp_channel(&handle, self_tx.clone()).await);
+                        let _ = reply.send(open_sftp_channel(&*handle.read().await, self_tx.clone()).await);
                     }
                     SshCmd::OpenShellChannel { rows, cols, reply } => {
-                        let _ = reply.send(open_shell_channel(&handle, rows, cols).await);
+                        let _ = reply.send(open_shell_channel(&*handle.read().await, rows, cols).await);
                     }
                     SshCmd::OpenExec { cmd, reply } => {
-                        let _ = reply.send(open_exec_channel(&handle, cmd).await);
+                        let _ = reply.send(open_exec_channel(&*handle.read().await, cmd).await);
                     }
                     SshCmd::StartForward { spec } => {
                         start_forward(
-                            &mut handle, spec, &mut forwards, &forward_tx, &forward_event_tx,
+                            &mut *handle.write().await, spec, &mut forwards, &forward_tx,
+                            &forward_event_tx,
                         )
                         .await;
                     }
                     SshCmd::StopForward { id } => {
-                        stop_forward(&handle, &id, &mut forwards, &forward_event_tx).await;
+                        stop_forward(&*handle.read().await, &id, &mut forwards, &forward_event_tx).await;
                     }
                 }
             }
@@ -1456,7 +1460,7 @@ async fn stop_forward(
 
 /// Everything the forwarding tasks need the russh handle for.
 async fn handle_forward_msg(
-    handle: &client::Handle<ClientHandler>,
+    handle: &std::rc::Rc<tokio::sync::RwLock<client::Handle<ClientHandler>>>,
     msg: ForwardMsg,
     forwards: &mut HashMap<String, RunningForward>,
     forward_tx: &async_channel::Sender<ForwardMsg>,
@@ -1469,19 +1473,23 @@ async fn handle_forward_msg(
             originator,
             reply,
         } => {
-            // This loop is the whole connection: a filtered target would freeze it.
-            let opened = tokio::time::timeout(
-                FORWARD_OPEN_TIMEOUT,
-                handle.channel_open_direct_tcpip(
-                    host,
-                    port as u32,
-                    originator.ip().to_string(),
-                    originator.port() as u32,
-                ),
-            )
-            .await
-            .unwrap_or(Err(russh::Error::ConnectionTimeout));
-            let _ = reply.send(opened);
+            // Off the loop: a filtered target must not freeze the whole connection.
+            let handle = handle.clone();
+            tokio::task::spawn_local(async move {
+                let handle = handle.read().await;
+                let opened = tokio::time::timeout(
+                    FORWARD_OPEN_TIMEOUT,
+                    handle.channel_open_direct_tcpip(
+                        host,
+                        port as u32,
+                        originator.ip().to_string(),
+                        originator.port() as u32,
+                    ),
+                )
+                .await
+                .unwrap_or(Err(russh::Error::ConnectionTimeout));
+                let _ = reply.send(opened);
+            });
         }
         ForwardMsg::Inbound {
             channel,
@@ -2017,6 +2025,11 @@ impl TransferTarget {
 /// everywhere only costs a wait.
 fn fold_local_case(path: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(path.to_string_lossy().to_lowercase())
+}
+
+/// The usual default on macOS and Windows; a case-sensitive volume there only loses a twin.
+fn is_local_case_insensitive() -> bool {
+    cfg!(any(target_os = "macos", target_os = "ios", windows))
 }
 
 /// True when `path` is `folder` or lies under it.
@@ -3042,7 +3055,7 @@ async fn list_dir(sftp: &SftpSession, path: &str) -> anyhow::Result<Vec<FileEntr
             };
             FileEntry {
                 name: e.file_name(),
-                is_dir: meta.is_dir(),
+                is_dir: kind == EntryKind::Folder,
                 size: meta.size.unwrap_or(0),
                 mtime: meta.mtime.unwrap_or(0),
                 permissions: meta.permissions,
@@ -3173,6 +3186,7 @@ async fn download_dir(
     // Breadth-first, each level listed concurrently: about one round-trip per level.
     let mut files: Vec<DownloadItem> = Vec::new();
     let mut skipped_links = 0usize;
+    let mut local_names: std::collections::HashSet<std::path::PathBuf> = Default::default();
     let mut dirs: Vec<std::path::PathBuf> = vec![local.to_path_buf()];
     let mut frontier: Vec<(String, std::path::PathBuf)> = vec![(
         remote.trim_end_matches('/').to_string(),
@@ -3203,6 +3217,14 @@ async fn download_dir(
                     continue;
                 }
                 let child_local = ldir.join(&entry.name);
+                if is_local_case_insensitive() && !local_names.insert(fold_local_case(&child_local))
+                {
+                    tracing::warn!(
+                        remote = %child_remote,
+                        "skipped during download: the name differs from another only in case"
+                    );
+                    continue;
+                }
                 // Use `kind`, not `is_dir`: `is_dir` is a bit test that is also
                 // true for sockets and block devices, which would abort the walk.
                 if matches!(entry.kind, EntryKind::Folder) {
@@ -4325,7 +4347,7 @@ struct ClientHandler {
 #[derive(Debug, PartialEq, Eq)]
 enum KnownHosts {
     Trusted,
-    /// Another key of the same type is listed; carries its "SHA256:..." fingerprint.
+    /// Other keys are listed; carries one's "SHA256:..." fingerprint, same type first.
     Changed(String),
     Unknown,
 }
@@ -4336,9 +4358,40 @@ fn known_hosts_verdict(recorded: &[PublicKey], presented: &PublicKey) -> KnownHo
     if recorded.contains(presented) {
         return KnownHosts::Trusted;
     }
-    match recorded.iter().find(|key| key.name() == presented.name()) {
+    // A key of another type counts too, or a MITM could swap ed25519 for RSA.
+    let recorded_key = recorded
+        .iter()
+        .find(|key| key.name() == presented.name())
+        .or(recorded.first());
+    match recorded_key {
         Some(key) => KnownHosts::Changed(format!("SHA256:{}", key.fingerprint())),
         None => KnownHosts::Unknown,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HostKeyDecision {
+    Accept,
+    /// Already in ~/.ssh/known_hosts: accept and remember it in the vault.
+    AcceptFromKnownHosts,
+    /// Ask the user; carries the fingerprint the presented key replaces, if any.
+    Prompt(Option<String>),
+}
+
+/// A vault mismatch must prompt even when known_hosts trusts the new key.
+fn host_key_decision(
+    expected: Option<&str>,
+    presented_fingerprint: &str,
+    known_hosts: impl FnOnce() -> KnownHosts,
+) -> HostKeyDecision {
+    match expected {
+        Some(stored) if stored == presented_fingerprint => HostKeyDecision::Accept,
+        Some(stored) => HostKeyDecision::Prompt(Some(stored.to_string())),
+        None => match known_hosts() {
+            KnownHosts::Trusted => HostKeyDecision::AcceptFromKnownHosts,
+            KnownHosts::Changed(recorded) => HostKeyDecision::Prompt(Some(recorded)),
+            KnownHosts::Unknown => HostKeyDecision::Prompt(None),
+        },
     }
 }
 
@@ -4370,48 +4423,41 @@ impl client::Handler for ClientHandler {
         let fingerprint = format!("SHA256:{}", server_public_key.fingerprint());
         let key_type = server_public_key.name().to_string();
 
-        let stored_fingerprint = match self.expected_host_key.as_deref() {
-            Some(stored) if stored == fingerprint => {
+        let expected = self.expected_host_key.clone();
+        let decision = host_key_decision(expected.as_deref(), &fingerprint, || {
+            self.check_known_hosts(server_public_key)
+        });
+        let stored_fingerprint = match decision {
+            HostKeyDecision::Accept => {
                 tracing::debug!(fingerprint, "host key matches stored fingerprint");
                 return Ok(true);
             }
-            Some(stored) => {
+            HostKeyDecision::AcceptFromKnownHosts => {
+                tracing::info!(fingerprint, "host key found in ~/.ssh/known_hosts");
+                let _ = self
+                    .event_tx
+                    .send(SshConnectionEvent::HostKeyTrusted {
+                        entry_id: self.entry_id.clone(),
+                        fingerprint,
+                    })
+                    .await;
+                return Ok(true);
+            }
+            HostKeyDecision::Prompt(Some(stored)) => {
+                let source = if expected.is_some() {
+                    "vault"
+                } else {
+                    "~/.ssh/known_hosts"
+                };
                 tracing::warn!(
                     stored,
                     presented = fingerprint,
+                    source,
                     "HOST KEY MISMATCH: server key changed"
                 );
-                Some(stored.to_string())
+                Some(stored)
             }
-            None => None,
-        };
-
-        // Not in the vault: fall back to ~/.ssh/known_hosts. A different key
-        // there counts as a changed key; an unreadable file as no entry.
-        let stored_fingerprint = match stored_fingerprint {
-            Some(stored) => Some(stored),
-            None => match self.check_known_hosts(server_public_key) {
-                KnownHosts::Trusted => {
-                    tracing::info!(fingerprint, "host key found in ~/.ssh/known_hosts");
-                    let _ = self
-                        .event_tx
-                        .send(SshConnectionEvent::HostKeyTrusted {
-                            entry_id: self.entry_id.clone(),
-                            fingerprint,
-                        })
-                        .await;
-                    return Ok(true);
-                }
-                KnownHosts::Changed(recorded) => {
-                    tracing::warn!(
-                        recorded,
-                        presented = fingerprint,
-                        "HOST KEY MISMATCH: ~/.ssh/known_hosts holds a different key"
-                    );
-                    Some(recorded)
-                }
-                KnownHosts::Unknown => None,
-            },
+            HostKeyDecision::Prompt(None) => None,
         };
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -4510,6 +4556,43 @@ mod tests {
         let (recorded, presented) = (new_public_key(), new_public_key());
         let expected = KnownHosts::Changed(format!("SHA256:{}", recorded.fingerprint()));
         assert_eq!(known_hosts_verdict(&[recorded], &presented), expected);
+    }
+
+    #[test]
+    fn a_key_of_another_type_in_known_hosts_is_a_changed_key() {
+        let recorded = new_public_key();
+        let presented = keys::key::KeyPair::generate_rsa(1024, keys::key::SignatureHash::SHA2_256)
+            .unwrap()
+            .clone_public_key()
+            .unwrap();
+        let expected = KnownHosts::Changed(format!("SHA256:{}", recorded.fingerprint()));
+        assert_eq!(known_hosts_verdict(&[recorded], &presented), expected);
+    }
+
+    #[test]
+    fn host_key_decision_order() {
+        let never = || -> KnownHosts { panic!("known_hosts must not be read") };
+        assert_eq!(
+            host_key_decision(Some("A"), "A", never),
+            HostKeyDecision::Accept
+        );
+        // A vault mismatch prompts even if known_hosts would trust the key.
+        assert_eq!(
+            host_key_decision(Some("A"), "B", never),
+            HostKeyDecision::Prompt(Some("A".into()))
+        );
+        assert_eq!(
+            host_key_decision(None, "B", || KnownHosts::Trusted),
+            HostKeyDecision::AcceptFromKnownHosts
+        );
+        assert_eq!(
+            host_key_decision(None, "B", || KnownHosts::Changed("C".into())),
+            HostKeyDecision::Prompt(Some("C".into()))
+        );
+        assert_eq!(
+            host_key_decision(None, "B", || KnownHosts::Unknown),
+            HostKeyDecision::Prompt(None)
+        );
     }
 
     #[test]
