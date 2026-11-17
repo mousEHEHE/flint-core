@@ -330,8 +330,77 @@ pub enum SnapshotColor {
     Rgb(u8, u8, u8),
 }
 
+/// Where a terminal's bytes go: a shell on a server, or one on this computer.
+pub enum ShellLink {
+    Ssh(Channel<russh::client::Msg>),
+    #[cfg(unix)]
+    Local(crate::local_shell::unix::LocalPty),
+}
+
+enum LinkEvent {
+    Output(Vec<u8>),
+    Exited,
+    /// The connection went away under the shell.
+    Lost,
+}
+
+impl ShellLink {
+    async fn send(&mut self, data: &[u8]) -> Result<(), String> {
+        match self {
+            Self::Ssh(channel) => channel.data(data).await.map_err(|e| e.to_string()),
+            #[cfg(unix)]
+            Self::Local(pty) => pty.send(data).await.map_err(|e| e.to_string()),
+        }
+    }
+
+    async fn resize(&mut self, rows: u16, cols: u16) -> Result<(), String> {
+        match self {
+            Self::Ssh(channel) => channel
+                .window_change(cols as u32, rows as u32, 0, 0)
+                .await
+                .map_err(|e| e.to_string()),
+            #[cfg(unix)]
+            Self::Local(pty) => {
+                pty.resize(rows, cols);
+                Ok(())
+            }
+        }
+    }
+
+    /// russh does not close a dropped channel, so the remote shell would live on
+    /// until the connection ends. A local pty hangs up its shell when dropped.
+    async fn close(&mut self) {
+        if let Self::Ssh(channel) = self {
+            let _ = channel.close().await;
+        }
+    }
+
+    async fn recv(&mut self) -> LinkEvent {
+        match self {
+            Self::Ssh(channel) => loop {
+                match channel.wait().await {
+                    Some(ChannelMsg::Data { data })
+                    | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                        return LinkEvent::Output(data.to_vec());
+                    }
+                    Some(ChannelMsg::ExitStatus { .. })
+                    | Some(ChannelMsg::Eof)
+                    | Some(ChannelMsg::Close) => return LinkEvent::Exited,
+                    None => return LinkEvent::Lost,
+                    Some(_) => {}
+                }
+            },
+            #[cfg(unix)]
+            Self::Local(pty) => match pty.recv().await {
+                crate::local_shell::unix::PtyEvent::Output(data) => LinkEvent::Output(data),
+                crate::local_shell::unix::PtyEvent::Exited => LinkEvent::Exited,
+            },
+        }
+    }
+}
+
 pub async fn handle_shell_commands(
-    mut channel: Channel<russh::client::Msg>,
+    mut link: ShellLink,
     initial_rows: u16,
     initial_cols: u16,
     cmd_rx: Receiver<ShellCmd>,
@@ -358,13 +427,13 @@ pub async fn handle_shell_commands(
                 match cmd {
                     Ok(ShellCmd::Input(data)) => {
                         emulator.scroll_to_bottom();
-                        if let Err(e) = channel.data(data.as_slice()).await {
+                        if let Err(e) = link.send(data.as_slice()).await {
                             let _ = event_tx.send(ShellEvent::Error(format!("send input: {e}"))).await;
                             break;
                         }
                     }
                     Ok(ShellCmd::Resize { rows, cols }) => {
-                        if let Err(e) = channel.window_change(cols as u32, rows as u32, 0, 0).await {
+                        if let Err(e) = link.resize(rows, cols).await {
                             let _ = event_tx.send(ShellEvent::Error(format!("resize: {e}"))).await;
                             break;
                         }
@@ -413,9 +482,8 @@ pub async fn handle_shell_commands(
                         let _ = event_tx.send(ShellEvent::Snapshot(emulator.snapshot())).await;
                     }
                     Err(_) => {
-                        // The tab was closed. russh does not close a dropped channel, so the
-                        // remote shell would otherwise live on until the connection ends.
-                        let _ = channel.close().await;
+                        // The tab was closed.
+                        link.close().await;
                         break;
                     }
                 }
@@ -445,13 +513,13 @@ pub async fn handle_shell_commands(
                 }
             }
 
-            msg = channel.wait() => {
-                match msg {
-                    Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+            event = link.recv() => {
+                match event {
+                    LinkEvent::Output(data) => {
                         emulator.advance(data.as_ref());
                         let replies = emulator.take_replies();
                         if !replies.is_empty() {
-                            if let Err(e) = channel.data(replies.as_slice()).await {
+                            if let Err(e) = link.send(replies.as_slice()).await {
                                 let _ = event_tx.send(ShellEvent::Error(format!("send reply: {e}"))).await;
                                 break;
                             }
@@ -468,17 +536,14 @@ pub async fn handle_shell_commands(
                             snapshot_timer.as_mut().reset(last_snapshot_at + SNAPSHOT_INTERVAL);
                         }
                     }
-                    Some(ChannelMsg::ExitStatus { .. })
-                    | Some(ChannelMsg::Eof)
-                    | Some(ChannelMsg::Close) => {
+                    LinkEvent::Exited => {
                         let _ = event_tx.send(ShellEvent::Exited).await;
                         break;
                     }
-                    None => {
+                    LinkEvent::Lost => {
                         let _ = event_tx.send(ShellEvent::Disconnected).await;
                         break;
                     }
-                    Some(_) => {}
                 }
             }
         }

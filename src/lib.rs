@@ -6,6 +6,7 @@ mod agent_forward;
 pub mod app;
 pub mod connection;
 pub mod forward;
+pub mod local_shell;
 pub mod ppk;
 pub mod proxy_command;
 pub mod route;

@@ -1647,7 +1647,12 @@ async fn open_shell_channel(
     let (visible_tx, visible_rx) = tokio::sync::watch::channel(true);
 
     tokio::task::spawn_local(handle_shell_commands(
-        channel, rows, cols, cmd_rx, event_tx, visible_rx,
+        crate::shell::ShellLink::Ssh(channel),
+        rows,
+        cols,
+        cmd_rx,
+        event_tx,
+        visible_rx,
     ));
 
     Ok(ShellHandle::new(cmd_tx, event_rx, visible_tx))
