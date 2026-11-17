@@ -2965,6 +2965,9 @@ pub fn key_is_encrypted(pem: &str) -> bool {
 }
 
 pub fn key_decodes_without_passphrase(pem: &str) -> bool {
+    if crate::ppk::is_ppk(pem) {
+        return crate::ppk::to_openssh(pem, None).is_ok();
+    }
     keys::decode_secret_key(pem, None).is_ok()
 }
 
@@ -2972,6 +2975,13 @@ pub fn key_decodes_without_passphrase(pem: &str) -> bool {
 /// path reports that error with full context.
 pub fn check_key_passphrase(pem: &str, passphrase: Option<&str>) -> Option<KeyIssue> {
     let pass = passphrase.filter(|p| !p.is_empty());
+    if crate::ppk::is_ppk(pem) {
+        return match crate::ppk::to_openssh(pem, pass) {
+            Err(crate::ppk::PpkError::NeedsPassphrase) => Some(KeyIssue::MissingPassphrase),
+            Err(crate::ppk::PpkError::WrongPassphrase) => Some(KeyIssue::WrongPassphrase),
+            _ => None,
+        };
+    }
     match keys::decode_secret_key(pem, pass) {
         Ok(_) => None,
         Err(keys::Error::KeyIsEncrypted) => Some(KeyIssue::MissingPassphrase),

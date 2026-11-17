@@ -901,6 +901,7 @@ impl VaultManager {
         pem: String,
         passphrase: Option<String>,
     ) -> Result<Uuid, VaultError> {
+        let (pem, passphrase) = openssh_form(pem, passphrase)?;
         let metadata = derive_key_metadata(&pem, passphrase.as_deref())?;
         self.push_key(name, pem, passphrase, metadata)
     }
@@ -944,6 +945,7 @@ impl VaultManager {
         pem: String,
         passphrase: Option<String>,
     ) -> Result<Uuid, VaultError> {
+        let (pem, passphrase) = openssh_form(pem, passphrase)?;
         // Reading a key with a passphrase is slow, so do it once here, not again in `add_key`.
         let metadata = derive_key_metadata(&pem, passphrase.as_deref())?;
         if let Some(existing) = self
@@ -1462,6 +1464,19 @@ impl VaultManager {
     }
 }
 
+/// A PuTTY key is kept as the OpenSSH key it holds, which needs no passphrase.
+fn openssh_form(
+    pem: String,
+    passphrase: Option<String>,
+) -> Result<(String, Option<String>), VaultError> {
+    if !crate::ppk::is_ppk(&pem) {
+        return Ok((pem, passphrase));
+    }
+    let converted = crate::ppk::to_openssh(&pem, passphrase.as_deref())
+        .map_err(|e| VaultError::InvalidKey(e.to_string()))?;
+    Ok((converted.to_string(), None))
+}
+
 fn new_ed25519_pem(comment: &str) -> Result<zeroize::Zeroizing<String>, VaultError> {
     use ssh_key::private::{Ed25519Keypair, KeypairData};
     let seed = zeroize::Zeroizing::new(rand::random::<[u8; 32]>());
@@ -1623,6 +1638,31 @@ mod tests {
         assert_eq!(users[0].label, "Prod web server");
         assert_eq!(users[0].username, "deploy");
         assert_eq!(users[0].host, "prod.example.com");
+    }
+
+    #[test]
+    fn a_putty_key_is_kept_as_its_openssh_key_without_a_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut vault, _) = make_vault(dir.path());
+        let fixtures = format!("{}/tests/fixtures/ppk", env!("CARGO_MANIFEST_DIR"));
+        let ppk = std::fs::read_to_string(format!("{fixtures}/ed25519-v3-pass.ppk")).unwrap();
+
+        let refused = vault.add_key("putty".into(), ppk.clone(), Some("wrong".into()));
+        assert!(matches!(refused, Err(VaultError::InvalidKey(_))));
+        let id = vault
+            .add_key("putty".into(), ppk.clone(), Some("correct horse".into()))
+            .unwrap();
+
+        let key = vault.get_key(id).unwrap();
+        assert!(key.pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
+        assert_eq!(key.passphrase, None);
+        let public = std::fs::read_to_string(format!("{fixtures}/ed25519.pub")).unwrap();
+        assert!(public.starts_with(&key.public_key), "{}", key.public_key);
+        // The same key again is found, not added twice.
+        let again = vault
+            .add_key_dedup("again".into(), ppk, Some("correct horse".into()))
+            .unwrap();
+        assert_eq!(again, id);
     }
 
     #[test]

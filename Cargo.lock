@@ -698,6 +698,7 @@ dependencies = [
 name = "flint-core"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "alacritty_terminal",
  "anyhow",
  "argon2",
@@ -705,12 +706,14 @@ dependencies = [
  "async-trait",
  "base64",
  "bip39",
+ "cbc",
  "chacha20poly1305",
  "ciborium",
  "dirs",
  "ed25519-dalek",
  "futures",
  "hkdf",
+ "hmac",
  "libc",
  "rand",
  "russh",
@@ -718,6 +721,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "ssh-key",
  "subtle",
