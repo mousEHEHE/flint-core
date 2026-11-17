@@ -48,6 +48,8 @@ pub(crate) enum ForwardMsg {
         forward_id: String,
         reason: String,
     },
+    /// Agent forwarding, which reaches the session handle the same way.
+    Agent(crate::agent_forward::AgentEvent),
 }
 
 /// Owned by `ssh::run_connection`.

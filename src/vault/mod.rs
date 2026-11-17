@@ -905,6 +905,13 @@ impl VaultManager {
         self.push_key(name, pem, passphrase, metadata)
     }
 
+    /// A new ed25519 key, in the OpenSSH format `ssh-keygen` writes, so it can
+    /// be exported and used anywhere. No passphrase: the vault encrypts it.
+    pub fn generate_key(&mut self, name: String) -> Result<Uuid, VaultError> {
+        let pem = new_ed25519_pem(&name)?;
+        self.add_key(name, pem.to_string(), None)
+    }
+
     fn push_key(
         &mut self,
         name: String,
@@ -1455,6 +1462,15 @@ impl VaultManager {
     }
 }
 
+fn new_ed25519_pem(comment: &str) -> Result<zeroize::Zeroizing<String>, VaultError> {
+    use ssh_key::private::{Ed25519Keypair, KeypairData};
+    let seed = zeroize::Zeroizing::new(rand::random::<[u8; 32]>());
+    let keypair = KeypairData::Ed25519(Ed25519Keypair::from_seed(&seed));
+    ssh_key::PrivateKey::new(keypair, comment)
+        .and_then(|key| key.to_openssh(ssh_key::LineEnding::LF))
+        .map_err(|e| VaultError::InvalidKey(e.to_string()))
+}
+
 struct KeyMetadata {
     fingerprint: String,
     key_type: String,
@@ -1567,6 +1583,7 @@ mod tests {
 
     fn test_entry() -> ServerEntry {
         ServerEntry {
+            forward_agent: false,
             id: Uuid::new_v4(),
             label: "Prod web server".into(),
             host: "prod.example.com".into(),
@@ -1606,6 +1623,27 @@ mod tests {
         assert_eq!(users[0].label, "Prod web server");
         assert_eq!(users[0].username, "deploy");
         assert_eq!(users[0].host, "prod.example.com");
+    }
+
+    #[test]
+    fn a_generated_key_is_a_new_openssh_ed25519_key_that_signs_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut vault, _) = make_vault(dir.path());
+
+        let first = vault.generate_key("laptop".into()).unwrap();
+        let second = vault.generate_key("laptop".into()).unwrap();
+
+        let key = vault.get_key(first).unwrap().clone();
+        assert!(key.pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----\n"));
+        assert!(
+            key.public_key.starts_with("ssh-ed25519 "),
+            "{}",
+            key.public_key
+        );
+        assert_eq!(key.passphrase, None);
+        // russh reads it back, so it can sign in.
+        assert!(keys::decode_secret_key(&key.pem, None).is_ok());
+        assert_ne!(key.fingerprint, vault.get_key(second).unwrap().fingerprint);
     }
 
     fn named_entry(label: &str) -> ServerEntry {

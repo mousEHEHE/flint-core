@@ -615,6 +615,10 @@ pub struct ServerEntry {
     pub startup_snippet: Option<Uuid>,
     #[serde(default)]
     pub snippets: Vec<HostSnippet>,
+    /// `ssh -A`: programs on the host may ask the local SSH agent to sign.
+    /// Off by default, as in OpenSSH: root on the host can use the agent too.
+    #[serde(default)]
+    pub forward_agent: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -641,6 +645,7 @@ impl fmt::Debug for ServerEntry {
             .field("forwards", &self.forwards.len())
             .field("startup_snippet", &self.startup_snippet)
             .field("snippets", &self.snippets.len())
+            .field("forward_agent", &self.forward_agent)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .finish_non_exhaustive()

@@ -79,9 +79,13 @@ pub fn route_for(
         jumps.push(hop(bastion, bastion_credential(vault, bastion)?));
     }
 
+    let mut target = hop(entry, credential);
+    // Whoever controls a team host could turn this on and use every member's
+    // agent, so a team host never gets it.
+    target.forward_agent = entry.forward_agent && vault.team_of(entry.id).is_none();
     Ok(SshRoute {
         jumps,
-        target: hop(entry, credential),
+        target,
         proxy,
     })
 }
@@ -122,5 +126,6 @@ fn hop(entry: &ServerEntry, credential: AuthCredential) -> SshHop {
         username: entry.username.clone(),
         credential,
         expected_host_key: entry.host_key_fingerprint.clone(),
+        forward_agent: entry.forward_agent,
     }
 }

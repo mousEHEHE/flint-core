@@ -326,6 +326,7 @@ mod tests {
 
     fn host(label: &str) -> ServerEntry {
         ServerEntry {
+            forward_agent: false,
             id: uuid::Uuid::new_v4(),
             label: label.into(),
             host: format!("{label}.example.com"),

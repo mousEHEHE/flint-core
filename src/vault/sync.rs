@@ -1698,6 +1698,7 @@ mod tests {
 
     fn host(label: &str) -> ServerEntry {
         ServerEntry {
+            forward_agent: false,
             id: Uuid::new_v4(),
             label: label.into(),
             host: format!("{label}.example.com"),
@@ -1874,6 +1875,29 @@ mod tests {
             AuthMethod::PrivateKey { key_id } => key_id,
             _ => panic!("the host does not log in with a key"),
         }
+    }
+
+    #[test]
+    fn a_team_host_never_forwards_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = synced_vault(&dir, "first.bin");
+        let (team, general) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mut own, mut shared) = (host("own"), host("shared"));
+        own.forward_agent = true;
+        shared.forward_agent = true;
+        vault.add_entry(own.clone()).unwrap();
+        vault.add_entry(shared.clone()).unwrap();
+        join_team(&mut vault, team, &[(general, None)]);
+        vault.share_entry(shared.id, general).unwrap();
+
+        let forwards = |entry: &ServerEntry| {
+            crate::route::route_for(&vault, entry, crate::ssh::AuthCredential::Agent)
+                .unwrap()
+                .target
+                .forward_agent
+        };
+        assert!(forwards(&own));
+        assert!(!forwards(&shared));
     }
 
     #[test]

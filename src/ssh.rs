@@ -1,13 +1,14 @@
 use russh::client;
 use russh::keys;
 use russh::keys::key::PublicKey;
-use russh::{Channel, ChannelMsg};
+use russh::{Channel, ChannelId, ChannelMsg};
 use russh_sftp::client::SftpSession;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
+use crate::agent_forward::AgentEvent;
 use crate::connection::{is_loopback_bind, ForwardKind, ForwardSpec, ResolvedProxy};
 use crate::forward::{ForwardMsg, RunningForward};
 use crate::shell::{handle_shell_commands, ShellHandle};
@@ -203,6 +204,8 @@ pub struct SshHop {
     pub username: String,
     pub credential: AuthCredential,
     pub expected_host_key: Option<String>,
+    /// Only the target's counts: a bastion never gets the agent.
+    pub forward_agent: bool,
 }
 
 /// Zero or more bastions, then the target. Only the first hop is reached over
@@ -1211,6 +1214,7 @@ async fn run_connection(
             return;
         }
     };
+    let forward_agent = route.target.forward_agent;
     // Credentials must not outlive authentication.
     drop(route);
     let ConnectedChain {
@@ -1239,6 +1243,7 @@ async fn run_connection(
     });
 
     let mut forwards: HashMap<String, RunningForward> = HashMap::new();
+    let mut agent_channels = crate::agent_forward::AgentChannels::new();
 
     tokio::pin!(disc_rx);
     loop {
@@ -1250,7 +1255,8 @@ async fn run_connection(
                         let _ = reply.send(open_sftp_channel(&*handle.read().await, self_tx.clone()).await);
                     }
                     SshCmd::OpenShellChannel { rows, cols, reply } => {
-                        let _ = reply.send(open_shell_channel(&*handle.read().await, rows, cols).await);
+                        let shell = open_shell_channel(&*handle.read().await, rows, cols, forward_agent).await;
+                        let _ = reply.send(shell);
                     }
                     SshCmd::OpenExec { cmd, reply } => {
                         let _ = reply.send(open_exec_channel(&*handle.read().await, cmd).await);
@@ -1268,7 +1274,9 @@ async fn run_connection(
                 }
             }
             msg = forward_rx.recv() => {
-                if let Ok(msg) = msg {
+                if let Ok(ForwardMsg::Agent(event)) = msg {
+                    crate::agent_forward::handle_event(&handle, event, &mut agent_channels);
+                } else if let Ok(msg) = msg {
                     handle_forward_msg(
                         &handle, msg, &mut forwards, &forward_tx, &forward_event_tx,
                     )
@@ -1530,6 +1538,8 @@ async fn handle_forward_msg(
                 },
             );
         }
+        // run_connection takes these before they get here.
+        ForwardMsg::Agent(_) => {}
         ForwardMsg::ListenerFailed { forward_id, reason } => {
             if forwards.remove(&forward_id).is_some() {
                 emit_forward(
@@ -1605,11 +1615,20 @@ async fn open_shell_channel(
     handle: &client::Handle<ClientHandler>,
     rows: u16,
     cols: u16,
+    forward_agent: bool,
 ) -> Result<ShellHandle, SshError> {
     let channel = handle
         .channel_open_session()
         .await
         .map_err(|e| SshError::ShellOpen(e.to_string()))?;
+
+    // Before the shell starts, so it gets SSH_AUTH_SOCK. A server that refuses
+    // still gives a shell, as with `ssh -A`.
+    if forward_agent {
+        if let Err(e) = channel.agent_forward(false).await {
+            tracing::warn!(%e, "could not ask for agent forwarding");
+        }
+    }
 
     channel
         .request_pty(true, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
@@ -2554,6 +2573,8 @@ where
         host: hop.host.clone(),
         port: hop.port,
         event_tx: event_tx.clone(),
+        is_agent_forwarded: hop.forward_agent && forward_tx.is_some(),
+        agent_channels: std::collections::HashSet::new(),
         forward_tx,
         prompt_pending: prompt_pending.clone(),
     };
@@ -4339,6 +4360,10 @@ struct ClientHandler {
     /// `None` on a jump hop: only the target is asked to listen, and a bastion's
     /// `forwarded-tcpip` channel would make us dial the forward's target for it.
     forward_tx: Option<async_channel::Sender<ForwardMsg>>,
+    /// The user turned agent forwarding on for this host, and this is the target.
+    is_agent_forwarded: bool,
+    /// russh reports the data of every channel to the handler; only these are the agent's.
+    agent_channels: std::collections::HashSet<ChannelId>,
     /// Set while a prompt waits on the user; pauses [`with_handshake_timeout`].
     prompt_pending: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -4513,6 +4538,55 @@ impl client::Handler for ClientHandler {
         // Unbounded: this can only fail once the connection is gone.
         if handed_over.is_err() {
             tracing::warn!(connected_port, "dropped an inbound forwarded connection");
+        }
+        Ok(())
+    }
+
+    /// A server can open an agent channel without being asked; then it is closed.
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        channel: ChannelId,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let forward_tx = self.forward_tx.as_ref().filter(|_| self.is_agent_forwarded);
+        let handed_over = forward_tx.is_some_and(|tx| {
+            tx.try_send(ForwardMsg::Agent(AgentEvent::Opened(channel)))
+                .is_ok()
+        });
+        if handed_over {
+            self.agent_channels.insert(channel);
+        } else {
+            tracing::warn!(host = %self.host, "an agent channel we did not ask for, closed");
+            session.close(channel);
+        }
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if !self.agent_channels.contains(&channel) {
+            return Ok(());
+        }
+        if let Some(tx) = &self.forward_tx {
+            let _ = tx.try_send(ForwardMsg::Agent(AgentEvent::Data(channel, data.to_vec())));
+        }
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if !self.agent_channels.remove(&channel) {
+            return Ok(());
+        }
+        if let Some(tx) = &self.forward_tx {
+            let _ = tx.try_send(ForwardMsg::Agent(AgentEvent::Closed(channel)));
         }
         Ok(())
     }

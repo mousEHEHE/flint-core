@@ -2,6 +2,7 @@
 //! vault and the account with sync. The desktop and mobile apps share it.
 
 pub mod account;
+mod agent_forward;
 pub mod app;
 pub mod connection;
 pub mod forward;
