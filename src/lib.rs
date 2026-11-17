@@ -7,6 +7,7 @@ pub mod app;
 pub mod connection;
 pub mod forward;
 pub mod ppk;
+pub mod proxy_command;
 pub mod route;
 pub mod shell;
 pub mod ssh;

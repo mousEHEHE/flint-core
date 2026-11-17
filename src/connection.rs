@@ -20,6 +20,8 @@ impl Connection {
 /// Vault-free proxy for the SSH transport. `addr` is the proxy's own `host:port`.
 #[derive(Debug, Clone)]
 pub enum ResolvedProxy {
+    /// `ProxyCommand`, its tokens already filled in.
+    Command(String),
     Socks5 {
         addr: String,
         auth: Option<(String, String)>,

@@ -619,6 +619,10 @@ pub struct ServerEntry {
     /// Off by default, as in OpenSSH: root on the host can use the agent too.
     #[serde(default)]
     pub forward_agent: bool,
+    /// `ProxyCommand`: a local command that is the link to this host when it is
+    /// the first one dialled. Never run for a team host.
+    #[serde(default)]
+    pub proxy_command: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -646,6 +650,8 @@ impl fmt::Debug for ServerEntry {
             .field("startup_snippet", &self.startup_snippet)
             .field("snippets", &self.snippets.len())
             .field("forward_agent", &self.forward_agent)
+            // A command may carry a token or password.
+            .field("proxy_command", &self.proxy_command.as_ref().map(|_| "[set]"))
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .finish_non_exhaustive()

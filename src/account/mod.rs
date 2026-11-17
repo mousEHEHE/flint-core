@@ -326,6 +326,7 @@ mod tests {
 
     fn host(label: &str) -> ServerEntry {
         ServerEntry {
+            proxy_command: None,
             forward_agent: false,
             id: uuid::Uuid::new_v4(),
             label: label.into(),

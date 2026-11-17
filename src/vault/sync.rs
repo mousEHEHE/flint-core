@@ -1698,6 +1698,7 @@ mod tests {
 
     fn host(label: &str) -> ServerEntry {
         ServerEntry {
+            proxy_command: None,
             forward_agent: false,
             id: Uuid::new_v4(),
             label: label.into(),
@@ -1875,6 +1876,38 @@ mod tests {
             AuthMethod::PrivateKey { key_id } => key_id,
             _ => panic!("the host does not log in with a key"),
         }
+    }
+
+    #[test]
+    fn a_proxy_command_is_run_for_the_dialled_host_but_never_from_a_team() {
+        use crate::connection::ResolvedProxy;
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = synced_vault(&dir, "first.bin");
+        let (team, general) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mut own, mut shared, mut behind) = (host("own"), host("shared"), host("behind"));
+        own.proxy_command = Some("cloudflared access ssh --hostname %h:%p".into());
+        shared.proxy_command = Some("touch /tmp/pwned".into());
+        // Its own command does not count: the bastion is the host that is dialled.
+        behind.proxy_command = Some("never-run".into());
+        behind.jump_host = Some(own.id);
+        for entry in [&own, &shared, &behind] {
+            vault.add_entry(entry.clone()).unwrap();
+        }
+        join_team(&mut vault, team, &[(general, None)]);
+        vault.share_entry(shared.id, general).unwrap();
+
+        let proxy_of = |entry: &ServerEntry| {
+            crate::route::route_for(&vault, entry, crate::ssh::AuthCredential::Agent).map(|route| {
+                match route.proxy {
+                    Some(ResolvedProxy::Command(command)) => command,
+                    other => panic!("not a command: {other:?}"),
+                }
+            })
+        };
+        let expected = "cloudflared access ssh --hostname own.example.com:22";
+        assert_eq!(proxy_of(&own).unwrap(), expected);
+        assert_eq!(proxy_of(&behind).unwrap(), expected);
+        assert!(proxy_of(&shared).unwrap_err().contains("team host"));
     }
 
     #[test]

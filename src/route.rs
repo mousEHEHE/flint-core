@@ -60,18 +60,11 @@ pub fn route_for(
 
     // Only the first hop is dialled over TCP, so its proxy is the one that counts; a jumped
     // target is never reached from this network at all.
-    let dialled = chain.first().map(|hop| hop.id).unwrap_or(entry.id);
-    let proxy = vault.resolve_proxy_for(dialled).map(|p| {
-        let addr = format!("{}:{}", p.host, p.port);
-        let auth = p
-            .auth
-            .as_ref()
-            .map(|a| (a.username.clone(), a.password.clone()));
-        match p.kind {
-            ProxyKind::Socks5 => ResolvedProxy::Socks5 { addr, auth },
-            ProxyKind::Http => ResolvedProxy::Http { addr, auth },
-        }
-    });
+    let dialled = chain.first().unwrap_or(entry);
+    let proxy = match proxy_command(vault, dialled)? {
+        Some(command) => Some(command),
+        None => network_proxy(vault, dialled.id),
+    };
 
     // The chain ends with the target, whose credential the caller already has.
     let mut jumps = Vec::new();
@@ -87,6 +80,50 @@ pub fn route_for(
         jumps,
         target,
         proxy,
+    })
+}
+
+/// The dialled host's `ProxyCommand` with its tokens filled in.
+fn proxy_command(
+    vault: &VaultManager,
+    dialled: &ServerEntry,
+) -> Result<Option<ResolvedProxy>, String> {
+    let command = dialled.proxy_command.as_deref().unwrap_or("").trim();
+    if command.is_empty() {
+        return Ok(None);
+    }
+    let name = if dialled.label.is_empty() {
+        &dialled.host
+    } else {
+        &dialled.label
+    };
+    // It runs on this computer: whoever edits a team host could run anything here.
+    if vault.team_of(dialled.id).is_some() {
+        return Err(format!(
+            "'{name}' is a team host with a ProxyCommand, and flint never runs one from a team."
+        ));
+    }
+    let expanded =
+        crate::proxy_command::expand(command, &dialled.host, dialled.port, &dialled.username)
+            .ok_or_else(|| {
+                format!(
+                    "The address or user of '{name}' has characters its ProxyCommand cannot take."
+                )
+            })?;
+    Ok(Some(ResolvedProxy::Command(expanded)))
+}
+
+fn network_proxy(vault: &VaultManager, dialled: uuid::Uuid) -> Option<ResolvedProxy> {
+    vault.resolve_proxy_for(dialled).map(|p| {
+        let addr = format!("{}:{}", p.host, p.port);
+        let auth = p
+            .auth
+            .as_ref()
+            .map(|a| (a.username.clone(), a.password.clone()));
+        match p.kind {
+            ProxyKind::Socks5 => ResolvedProxy::Socks5 { addr, auth },
+            ProxyKind::Http => ResolvedProxy::Http { addr, auth },
+        }
     })
 }
 

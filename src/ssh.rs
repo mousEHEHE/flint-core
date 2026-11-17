@@ -2449,8 +2449,13 @@ async fn connect_hop(
     ),
     HopFailure,
 > {
-    match previous {
-        None => {
+    match (previous, proxy) {
+        (None, Some(ResolvedProxy::Command(command))) => {
+            connect_via_command(hop, command, event_tx, forward_tx)
+                .await
+                .map_err(|error| hop.failed(error))
+        }
+        (None, _) => {
             let stream = connect_tcp(&hop.host, hop.port, proxy)
                 .await
                 .map_err(|error| hop.failed(error))?;
@@ -2458,7 +2463,7 @@ async fn connect_hop(
                 .await
                 .map_err(|error| hop.failed(error))
         }
-        Some((jump_hop, jump_session)) => {
+        (Some((jump_hop, jump_session)), _) => {
             // A tunnel that never opens is the bastion refusing, not the hop
             // behind it. Tag it so the UI names the machine that said no.
             let stream = open_tunnel(jump_hop, jump_session, hop)
@@ -2618,6 +2623,38 @@ where
     Ok((session, disconnect_rx))
 }
 
+/// The link is the command's stdin and stdout. When it fails, the last line
+/// the command wrote to stderr says why better than "connection closed".
+async fn connect_via_command(
+    hop: &SshHop,
+    command: &str,
+    event_tx: &async_channel::Sender<SshConnectionEvent>,
+    forward_tx: Option<&async_channel::Sender<ForwardMsg>>,
+) -> Result<
+    (
+        client::Handle<ClientHandler>,
+        tokio::sync::oneshot::Receiver<()>,
+    ),
+    AuthError,
+> {
+    let (stream, last_error) = crate::proxy_command::spawn(command).map_err(|e| {
+        AuthError::ConnectionFailed(format!("could not start the ProxyCommand: {e}"))
+    })?;
+    let connected = connect_and_auth(hop, stream, event_tx.clone(), forward_tx.cloned()).await;
+    let Err(AuthError::ConnectionFailed(reason)) = connected else {
+        return connected;
+    };
+    // stderr is read by its own task, which may be a moment behind.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let said = last_error.get();
+    if said.is_empty() {
+        return Err(AuthError::ConnectionFailed(format!(
+            "ProxyCommand: {reason}"
+        )));
+    }
+    Err(AuthError::ConnectionFailed(format!("ProxyCommand: {said}")))
+}
+
 /// The hostname goes to the proxy for remote DNS and is never resolved locally,
 /// so it does not leak onto the local network.
 async fn connect_via_proxy(
@@ -2641,6 +2678,10 @@ async fn connect_via_proxy(
         ResolvedProxy::Http { addr, auth } => {
             connect_http_proxy(addr, auth.as_ref(), host, port).await
         }
+        // connect_hop runs a command itself and never dials it.
+        ResolvedProxy::Command(_) => Err(AuthError::ConnectionFailed(
+            "a ProxyCommand is not a network proxy".to_string(),
+        )),
     }
 }
 

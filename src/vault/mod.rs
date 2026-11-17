@@ -1598,6 +1598,7 @@ mod tests {
 
     fn test_entry() -> ServerEntry {
         ServerEntry {
+            proxy_command: None,
             forward_agent: false,
             id: Uuid::new_v4(),
             label: "Prod web server".into(),
