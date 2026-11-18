@@ -1249,12 +1249,36 @@ impl VaultManager {
             .shared
             .retain(|_, vault_id| vaults.contains_key(vault_id));
         let still_shared: BTreeSet<Uuid> = state.shared.keys().copied().collect();
+        let mut copies = BTreeSet::new();
         for id in lost {
             let copy_id = self.personal_copy_id(id);
             self.payload.give_new_id(id, copy_id, &still_shared);
             self.note_renamed(id, copy_id);
+            copies.insert(copy_id);
         }
+        self.drop_team_options_of(&copies);
         self.save()
+    }
+
+    /// The records of `ids` stay here as personal ones.
+    fn drop_team_options_of(&mut self, ids: &BTreeSet<Uuid>) {
+        for entry in &mut self.payload.entries {
+            if ids.contains(&entry.id) {
+                entry.drop_team_options();
+            }
+        }
+    }
+
+    /// The records a team shares with this account now, or did when it signed out.
+    fn team_record_ids(&self) -> BTreeSet<Uuid> {
+        let state = self
+            .payload
+            .sync
+            .as_ref()
+            .or(self.payload.signed_out.as_ref());
+        state
+            .map(|state| state.shared.keys().copied().collect())
+            .unwrap_or_default()
     }
 
     fn note_renamed(&mut self, old: Uuid, new: Uuid) {
@@ -1392,6 +1416,17 @@ impl VaultManager {
         self.payload.sync.as_ref()?.shared.get(&entry_id).copied()
     }
 
+    /// Shared with a team, or was when the account signed out. What a team sets that acts on
+    /// this computer (a ProxyCommand, the agent, auto-started forwards) is never used for it.
+    pub fn is_team_record(&self, id: Uuid) -> bool {
+        let state = self
+            .payload
+            .sync
+            .as_ref()
+            .or(self.payload.signed_out.as_ref());
+        state.is_some_and(|state| state.shared.contains_key(&id))
+    }
+
     /// The team a host is shared with, if any.
     pub fn team_of(&self, entry_id: Uuid) -> Option<Uuid> {
         let state = self.payload.sync.as_ref()?;
@@ -1521,9 +1556,13 @@ impl VaultManager {
         self.save()
     }
 
-    /// Forget the account. Every record stays in the vault.
+    /// Forget the account. Every record stays in the vault. The state is set aside: without it,
+    /// signing in again would take the server's deletions for records new here.
     pub fn sign_out(&mut self) -> Result<(), VaultError> {
-        self.payload.sync = None;
+        if let Some(mut state) = self.payload.sync.take() {
+            state.session_token = None;
+            self.payload.signed_out = Some(state);
+        }
         self.save()
     }
 
@@ -1536,12 +1575,17 @@ impl VaultManager {
             &mut self.enc_dek_by_recovery,
             registration.enc_dek_by_recovery,
         );
+        // A new account: records of an earlier one's teams stay as personal ones.
+        let leaving = self.team_record_ids();
+        self.drop_team_options_of(&leaving);
+        let old_signed_out = self.payload.signed_out.take();
         let old_sync = self.payload.sync.replace(registration.state);
 
         let saved = self.save();
         if saved.is_err() {
             self.enc_dek_by_recovery = old_recovery;
             self.payload.sync = old_sync;
+            self.payload.signed_out = old_signed_out;
         }
         saved
     }
@@ -1550,16 +1594,24 @@ impl VaultManager {
     /// Records here stay and go to the account on the next sync.
     pub fn adopt_account(&mut self, account: AdoptedAccount) -> Result<(), VaultError> {
         let mut state = account.state;
+        let previous = self
+            .payload
+            .sync
+            .as_ref()
+            .or(self.payload.signed_out.as_ref());
         // Signing in again to the same account continues from where it was.
-        if let Some(old) = &self.payload.sync {
-            if old.vault_id == state.vault_id {
-                let session_token = state.session_token.take();
-                state = SyncState {
-                    session_token,
-                    ..old.clone()
-                };
-            }
+        if let Some(old) = previous.filter(|old| old.vault_id == state.vault_id) {
+            let session_token = state.session_token.take();
+            state = SyncState {
+                session_token,
+                ..old.clone()
+            };
+        } else {
+            // Records of the other account's teams stay as personal ones.
+            let leaving = self.team_record_ids();
+            self.drop_team_options_of(&leaving);
         }
+        let old_signed_out = self.payload.signed_out.take();
 
         let old_dek = Zeroizing::new(*self.dek);
         let old_salt = std::mem::replace(&mut self.kdf_salt, account.kdf_salt);
@@ -1580,6 +1632,7 @@ impl VaultManager {
             self.enc_dek_by_password = old_password;
             self.enc_dek_by_recovery = old_recovery;
             self.payload.sync = old_sync;
+            self.payload.signed_out = old_signed_out;
         }
         saved
     }
@@ -1908,6 +1961,93 @@ mod tests {
         assert_eq!(proxy_of(&own).unwrap(), expected);
         assert_eq!(proxy_of(&behind).unwrap(), expected);
         assert!(proxy_of(&shared).unwrap_err().contains("team host"));
+    }
+
+    fn team_host_with_local_options() -> ServerEntry {
+        let mut shared = host("shared");
+        shared.proxy_command = Some("touch /tmp/pwned".into());
+        shared.forward_agent = true;
+        shared.forwards = vec![super::super::format::PortForward {
+            id: Uuid::new_v4(),
+            name: "db".into(),
+            kind: crate::connection::ForwardKind::Local,
+            bind_address: "0.0.0.0".into(),
+            bind_port: 5432,
+            target_host: "db.internal".into(),
+            target_port: 5432,
+            auto_start: true,
+        }];
+        shared
+    }
+
+    #[test]
+    fn a_host_kept_from_a_lost_team_vault_loses_the_teams_local_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = synced_vault(&dir, "first.bin");
+        let (team, general) = (Uuid::new_v4(), Uuid::new_v4());
+        let shared = team_host_with_local_options();
+        vault.add_entry(shared.clone()).unwrap();
+        join_team(&mut vault, team, &[(general, None)]);
+        vault.share_entry(shared.id, general).unwrap();
+
+        // Removed from the team: the vault is lost, the host stays as a personal copy.
+        see_team(&mut vault, team, &[(general, None)], &[]);
+        let copy = vault.get_entry(vault.current_id(shared.id)).unwrap();
+        assert!(!vault.is_team_record(copy.id));
+        assert_eq!(copy.proxy_command, None);
+        assert!(!copy.forward_agent);
+        assert!(!copy.forwards[0].auto_start);
+    }
+
+    #[test]
+    fn a_team_host_stays_one_after_sign_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = synced_vault(&dir, "first.bin");
+        let (team, general) = (Uuid::new_v4(), Uuid::new_v4());
+        let shared = team_host_with_local_options();
+        vault.add_entry(shared.clone()).unwrap();
+        join_team(&mut vault, team, &[(general, None)]);
+        vault.share_entry(shared.id, general).unwrap();
+
+        vault.sign_out().unwrap();
+        assert!(vault.sync_state().is_none());
+        assert!(vault.is_team_record(shared.id));
+        let entry = vault.get_entry(shared.id).unwrap();
+        assert!(
+            crate::route::route_for(&vault, &entry, crate::ssh::AuthCredential::Agent).is_err()
+        );
+    }
+
+    #[test]
+    fn signing_in_again_keeps_what_was_deleted_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = synced_vault(&dir, "first.bin");
+        let mut second = second_device(&dir, &first);
+        let mut server = FakeServer::default();
+        let web = host("web");
+        first.add_entry(web.clone()).unwrap();
+        server.sync(&mut first);
+        server.sync(&mut second);
+
+        first.sign_out().unwrap();
+        second.delete_entry(web.id).unwrap();
+        server.sync(&mut second);
+        let password = SecretString::new("pw".into());
+        let slot = first.password_slot();
+        let account = AdoptedAccount {
+            dek: slot.open(&password).unwrap().dek,
+            kdf_salt: slot.kdf_salt(),
+            kdf_params: slot.kdf_params().clone(),
+            enc_dek_by_password: slot.enc_dek_by_password().clone(),
+            enc_dek_by_recovery: first.enc_dek_by_recovery.clone(),
+            state: SyncState::new(Uuid::nil(), "alice".into(), "fresh".into(), Uuid::nil()),
+        };
+        first.adopt_account(account).unwrap();
+        server.sync(&mut first);
+        server.sync(&mut second);
+
+        assert!(first.get_entry(web.id).is_err());
+        assert!(second.get_entry(web.id).is_err());
     }
 
     #[test]

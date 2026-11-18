@@ -75,7 +75,7 @@ pub fn route_for(
     let mut target = hop(entry, credential);
     // Whoever controls a team host could turn this on and use every member's
     // agent, so a team host never gets it.
-    target.forward_agent = entry.forward_agent && vault.team_of(entry.id).is_none();
+    target.forward_agent = entry.forward_agent && !vault.is_team_record(entry.id);
     Ok(SshRoute {
         jumps,
         target,
@@ -98,7 +98,7 @@ fn proxy_command(
         &dialled.label
     };
     // It runs on this computer: whoever edits a team host could run anything here.
-    if vault.team_of(dialled.id).is_some() {
+    if vault.is_team_record(dialled.id) {
         return Err(format!(
             "'{name}' is a team host with a ProxyCommand, and flint never runs one from a team."
         ));

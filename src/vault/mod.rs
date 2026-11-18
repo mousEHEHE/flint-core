@@ -330,6 +330,7 @@ impl VaultManager {
             proxies: Vec::new(),
             proxy_routing: ProxyRouting::default(),
             sync,
+            signed_out: None,
             team_pins: Vec::new(),
             joins: Vec::new(),
         };
@@ -670,6 +671,7 @@ impl VaultManager {
             return Ok(());
         }
         *stored = password.to_string();
+        entry.updated_at = unix_now() as i64;
         self.save()
     }
 
@@ -828,6 +830,8 @@ impl VaultManager {
             return Ok(());
         }
         entry.jump_host = jump;
+        // Sync keeps the newer copy of a record, so an edit must move its date.
+        entry.updated_at = unix_now() as i64;
         self.save()
     }
 
@@ -1108,6 +1112,7 @@ impl VaultManager {
             return Ok(());
         }
         entry.proxy = choice;
+        entry.updated_at = unix_now() as i64;
         self.save()
     }
 

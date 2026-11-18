@@ -73,6 +73,9 @@ pub struct VaultPayload {
     /// `None` = local only, not signed in to sync.
     #[serde(default)]
     pub sync: Option<crate::vault::sync::SyncState>,
+    /// The state at sign-out, so signing in again to the same account resumes from it.
+    #[serde(default)]
+    pub(crate) signed_out: Option<crate::vault::sync::SyncState>,
     /// Where this account joined each of its teams; synced with the personal vault.
     #[serde(default)]
     pub team_pins: Vec<crate::vault::sync::TeamPin>,
@@ -651,10 +654,24 @@ impl fmt::Debug for ServerEntry {
             .field("snippets", &self.snippets.len())
             .field("forward_agent", &self.forward_agent)
             // A command may carry a token or password.
-            .field("proxy_command", &self.proxy_command.as_ref().map(|_| "[set]"))
+            .field(
+                "proxy_command",
+                &self.proxy_command.as_ref().map(|_| "[set]"),
+            )
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .finish_non_exhaustive()
+    }
+}
+
+impl ServerEntry {
+    /// For a record leaving its team: what the team set that acts on this computer goes.
+    pub(crate) fn drop_team_options(&mut self) {
+        self.proxy_command = None;
+        self.forward_agent = false;
+        for forward in &mut self.forwards {
+            forward.auto_start = false;
+        }
     }
 }
 
