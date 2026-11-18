@@ -4480,9 +4480,11 @@ impl ClientHandler {
     fn check_known_hosts(&self, presented: &PublicKey) -> KnownHosts {
         let recorded: Vec<PublicKey> = match keys::known_host_keys(&self.host, self.port) {
             Ok(lines) => lines.into_iter().map(|(_, key)| key).collect(),
+            // russh stops at the first line for this host it cannot parse (ssh-dss, a cut line),
+            // and a missing file is no error. So a key may be recorded: never call it new.
             Err(e) => {
                 tracing::warn!(host = %self.host, %e, "could not read ~/.ssh/known_hosts");
-                Vec::new()
+                return KnownHosts::Changed("a key in known_hosts flint cannot read".into());
             }
         };
         known_hosts_verdict(&recorded, presented)
